@@ -1,0 +1,10 @@
+{
+  "database": {
+    "server": "localhost",
+    "database": "atana",
+    "trusted_connection": false,
+    "driver": "ODBC Driver 18 for SQL Server",
+    "username": "atana_user",
+    "password": "YOUR_DB_PASSWORD"
+  }
+}
