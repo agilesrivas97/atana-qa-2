@@ -1,0 +1,53 @@
+name: Build Tools
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "tools/setup_db_cli.py"
+      - "tools/extractor.py"
+      - "tools/build_setup_db.py"
+      - "tools/build_extractor.py"
+
+jobs:
+  build-tools:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: pip install --quiet pyinstaller pyodbc cryptography Pillow zxing-cpp pyotp
+
+      - name: Build atana_setup_db.exe
+        run: python tools/build_setup_db.py
+
+      - name: Build atana_extractor.exe
+        run: python tools/build_extractor.py
+
+      - name: Commit updated binaries
+        shell: pwsh
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f tools/dist/atana_setup.exe tools/dist/atana_otp.exe
+          $status = git status --porcelain
+          if ($status) {
+            git commit -m "build(tools): update binaries [skip ci]"
+            git push
+          } else {
+            Write-Host "No changes in binaries — nothing to commit"
+          }

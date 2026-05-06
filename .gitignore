@@ -1,0 +1,61 @@
+# ── Credenciales y configuración ──────────────────────────────────────────────
+config.json
+config.enc
+*.pem                  # claves privadas Y públicas — la pública va en agent_loader.py
+*.key
+*.p12
+*.pfx
+
+
+# ── Liquidaciones y archivos descargados ──────────────────────────────────────
+settlements/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+
+# ── Build y distribución ──────────────────────────────────────────────────────
+dist/exe/           # exe compilado — se sube a GitHub Releases, no al repo
+dist/release/       # agentes firmados — se suben a GitHub Releases, no al repo
+build/work/
+*.spec
+*.exe
+*.new
+*.bak
+
+# ── tools/setup_db build artifacts ───────────────────────────────────────────
+tools/dist/
+!tools/dist/atana_setup.exe
+!tools/dist/atana_otp.exe
+tools/_build_work/
+tools/_build_spec/
+
+
+# ── Tests y cobertura ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+
+dist/
+
+
+*.jpeg
