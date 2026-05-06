@@ -1,0 +1,21 @@
+name: Mirror main to secondary repo on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push main to mirror
+        run: |
+          git remote add mirror https://x-access-token:${{ secrets.MIRROR_PAT }}@github.com/${{ vars.MIRROR_REPO }}.git
+          git push mirror refs/remotes/origin/main:refs/heads/main --force

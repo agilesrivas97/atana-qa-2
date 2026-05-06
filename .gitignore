@@ -6,8 +6,11 @@ config.enc
 *.p12
 *.pfx
 
+atana_private.pem
+atana_public.pem
 
 # ── Liquidaciones y archivos descargados ──────────────────────────────────────
+liquidaciones/
 settlements/
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
@@ -41,6 +44,8 @@ tools/dist/
 tools/_build_work/
 tools/_build_spec/
 
+# ── Firmas de agentes (generadas por build/sign.py) ───────────────────────────
+agents/*.sig
 
 # ── Tests y cobertura ─────────────────────────────────────────────────────────
 .pytest_cache/
