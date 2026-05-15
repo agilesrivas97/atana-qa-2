@@ -10,25 +10,29 @@ Authentication flow (confirmed from network capture 2026-04-16):
   4. POST /settlement/Settlement/SettlementFileList  → file list
   5. POST /settlement/Settlement/downloadUploadedFile → file content
 
-The JWT is cached in session_store for 8 hours to avoid re-authenticating
-on every run. TOTP mode is fully automatic — no human intervention needed.
+A real Chromium browser (Playwright) is used to bypass Radware Bot Manager.
+A single browser context is shared across login, list_files and download for
+the duration of each job, so Radware cookies set on the warm-up GET persist
+through all subsequent API calls.
+
+A fresh JWT is obtained on every job run — no caching.
 
 Config keys (extra_config JSON):
   auth_mode          "totp"  (only supported mode)
   totp_secret_enc    Fernet-encrypted TOTP shared secret
-  capture_timeout_sec  unused (kept for schema compatibility)
+  api_base_url       optional override (default: API_BASE_URL)
 """
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 
+import json as _json
+import re as _re
 from pathlib import Path
 from typing import Optional
 
 import pyotp
-from curl_cffi import requests as cffi_requests
 from loguru import logger
 
-from agents.base import AgentBase, SessionExpired
-from shared.session_store import SessionStore
+from agents.base import AgentBase
 
 
 API_BASE_URL = "https://merchantcenter.fiservapp.com"
@@ -40,7 +44,10 @@ class FiservAgent(AgentBase):
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self.session_store = SessionStore(self.name)
+        self._base    = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
+        self._pw      = None
+        self._browser = None
+        self._pw_ctx  = None
         self.jwt: Optional[str] = None
 
     # ── Intervention — never needed in TOTP mode ──────────────────────────────
@@ -48,37 +55,38 @@ class FiservAgent(AgentBase):
     def requires_intervention(self) -> bool:
         return False
 
-    def run(self, job_id: int, **kwargs) -> dict:
-        try:
-            return super().run(job_id, **kwargs)
-        except SessionExpired:
-            logger.info(f"[{self.name}] Session expired — re-logging automatically...")
-            if not self._login_totp():
-                raise
-            logger.info(f"[{self.name}] Re-login successful — retrying job...")
-            return super().run(job_id, **kwargs)
-
     # ── Login / logout ────────────────────────────────────────────────────────
 
     def login(self) -> bool:
-        """Re-uses cached JWT when still valid; otherwise does full TOTP login."""
-        cached = self.session_store.get()
-        if cached and cached.get("jwt"):
-            self.jwt = cached["jwt"]
-            logger.info(f"[{self.name}] Reusing cached JWT")
-            return True
+        """Always performs a full TOTP login — no JWT caching."""
         return self._login_totp()
 
     def logout(self):
         self.jwt = None
+        if self._pw_ctx:
+            try:
+                self._pw_ctx.close()
+            except Exception:
+                pass
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+        self._pw_ctx = self._browser = self._pw = None
 
-    def _browser_headers(self, base: str, extra: dict = None) -> dict:
+    def _browser_headers(self, extra: dict = None) -> dict:
         headers = {
             "Accept":             "application/json, text/plain, */*",
             "Accept-Language":    "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding":    "gzip, deflate, br",
-            "Origin":             base,
-            "Referer":            base + "/",
+            "Origin":             self._base,
+            "Referer":            self._base + "/",
             "sec-ch-ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
             "sec-ch-ua-mobile":   "?0",
             "sec-ch-ua-platform": '"Windows"',
@@ -90,6 +98,79 @@ class FiservAgent(AgentBase):
         if extra:
             headers.update(extra)
         return headers
+
+    # ── Playwright context ────────────────────────────────────────────────────
+
+    def _ensure_pw_ctx(self):
+        """Creates the shared Playwright browser context once per job.
+        The warm-up GET lets Radware run its JS challenge and set cookies
+        that are reused by all subsequent API calls in the same context."""
+        if self._pw_ctx is not None:
+            return
+
+        from playwright.sync_api import sync_playwright
+        try:
+            from playwright_stealth import stealth_sync
+        except ImportError:
+            stealth_sync = None
+
+        self._pw      = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=True)
+        self._pw_ctx  = self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        page = self._pw_ctx.new_page()
+        if stealth_sync:
+            stealth_sync(page)
+        try:
+            page.goto(self._base, wait_until="networkidle", timeout=30_000)
+        except Exception:
+            page.goto(self._base, wait_until="domcontentloaded", timeout=30_000)
+        page.close()
+        logger.info(f"[{self.name}] Playwright context ready (Radware warm-up done)")
+
+    def _pw_post(self, url: str, payload: dict, extra_headers: dict = None) -> dict:
+        """POST via shared Playwright context — returns parsed JSON."""
+        self._ensure_pw_ctx()
+        resp = self._pw_ctx.request.post(
+            url,
+            data=_json.dumps(payload),
+            headers=self._browser_headers(extra_headers),
+        )
+        text = resp.text()
+        logger.debug(f"[{self.name}] POST {url} → status={resp.status} body={text[:300]}")
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"[fiserv][pw] HTTP {resp.status}: {text[:200]}")
+        if "Radware Bot Manager" in text or ("captcha" in text.lower() and "<html" in text.lower()):
+            raise RuntimeError("[fiserv][pw] Radware still blocking — check stealth setup")
+        try:
+            return _json.loads(text) if text.strip() else {}
+        except ValueError:
+            raise RuntimeError(f"[fiserv][pw] Non-JSON response: {text[:300]}")
+
+    def _pw_bytes(self, url: str, payload: dict, extra_headers: dict = None) -> bytes:
+        """POST via shared Playwright context — returns raw bytes (for file downloads)."""
+        self._ensure_pw_ctx()
+        resp = self._pw_ctx.request.post(
+            url,
+            data=_json.dumps(payload),
+            headers=self._browser_headers(extra_headers),
+        )
+        if resp.status == 401:
+            raise RuntimeError("[fiserv][pw] JWT expired (401)")
+        if resp.status != 200:
+            raise RuntimeError(f"[fiserv][pw] Download HTTP {resp.status}: {resp.text()[:200]}")
+        content = resp.body()
+        logger.debug(
+            f"[{self.name}] POST {url} → status={resp.status} "
+            f"content-type={resp.headers.get('content-type', '?')} "
+            f"size={len(content):,} bytes"
+        )
+        return content
 
     # ── TOTP authentication ───────────────────────────────────────────────────
 
@@ -105,20 +186,17 @@ class FiservAgent(AgentBase):
 
         Step 3 — POST /api/Users/authenticate
           Body: {username, password, otp, deviceName:username, totpToken}
-          Response: data.token  (JWT, valid ~8h)
+          Response: data.token  (JWT)
         """
-        try:
-            import pyotp
-        except ImportError:
-            raise RuntimeError("pyotp is required — run: pip install pyotp")
-
         secret   = self.config.get("totp_secret", "")
         username = self.config.get("username", "")
         password = self.config.get("password", "")
-        base     = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
 
-        # Diagnostic: log which keys arrived from extra_config decryption
-        extra_keys = [k for k in self.config if k not in ("username", "password", "destination_folder", "rename_pattern", "provider", "enabled", "portal_url", "schedule_hour", "schedule_minute", "max_retries", "retry_interval_min")]
+        extra_keys = [k for k in self.config if k not in (
+            "username", "password", "destination_folder", "rename_pattern",
+            "provider", "enabled", "portal_url", "schedule_hour",
+            "schedule_minute", "max_retries", "retry_interval_min",
+        )]
         logger.debug(f"[{self.name}] Config keys from extra_config: {extra_keys}")
         logger.debug(f"[{self.name}] totp_secret present: {bool(secret)}, length: {len(secret)}, starts_with: {secret[:6]!r}")
 
@@ -132,88 +210,49 @@ class FiservAgent(AgentBase):
         logger.debug(f"[{self.name}] password present: {bool(password)}, len={len(password)}")
         logger.info(f"[{self.name}] TOTP login — requesting OTP challenge...")
 
-        with cffi_requests.Session(impersonate="chrome124") as client:
-            try:
-                client.get(base + "/", timeout=15)
-                logger.debug(f"[{self.name}] Warm-up GET {base}/ completed")
-            except Exception as _e:
-                logger.debug(f"[{self.name}] Warm-up GET failed (non-fatal): {_e}")
+        # Step 1 — request OTP challenge
+        body1 = self._pw_post(
+            f"{self._base}/api/Users/requestOtp",
+            {
+                "username":           username,
+                "password":           password,
+                "deviceName":         "",
+                "phoneNumber":        "",
+                "typeAuthentication": "TOTP",
+            },
+        )
+        data1      = body1.get("data", body1)
+        totp_token = data1.get("totpToken") or data1.get("token") or ""
+        logger.debug(f"[{self.name}] OTP challenge received — totpToken present: {bool(totp_token)}, len={len(totp_token)}")
 
-            # Step 1 — request OTP challenge
-            r1 = client.post(
-                f"{base}/api/Users/requestOtp",
-                json={
-                    "username":           username,
-                    "password":           password,
-                    "deviceName":         "",
-                    "phoneNumber":        "",
-                    "typeAuthentication": "TOTP",
-                },
-                headers=self._browser_headers(base),
-                timeout=30,
-            )
-            logger.debug(f"[{self.name}] requestOtp status={r1.status_code} body={r1.text[:300]}")
-            if r1.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"[fiserv] requestOtp failed: {r1.status_code} {r1.text[:200]}"
-                )
-            if "Radware Bot Manager" in r1.text or "captcha" in r1.text.lower():
-                raise RuntimeError(
-                    "[fiserv] Blocked by Radware Bot Manager CAPTCHA — IP may be flagged"
-                )
+        # Step 2 — generate OTP
+        secret_b32 = _re.sub(r'[\s\-=]', '', secret).upper()
+        otp_code   = pyotp.TOTP(secret_b32).now()
+        logger.debug(f"[{self.name}] OTP generated: {otp_code}")
 
-            try:
-                body1 = r1.json() if r1.content else {}
-            except ValueError:
-                raise RuntimeError(f"[fiserv] Non-JSON on requestOtp (status 200): {r1.text[:300]}")
-            data1      = body1.get("data", body1)
-            totp_token = data1.get("totpToken") or data1.get("token") or ""
-            logger.debug(f"[{self.name}] OTP challenge received — totpToken present: {bool(totp_token)}, len={len(totp_token)}")
+        # Step 3 — authenticate
+        body2 = self._pw_post(
+            f"{self._base}/api/Users/authenticate",
+            {
+                "username":   username,
+                "password":   password,
+                "otp":        otp_code,
+                "deviceName": username,
+                "totpToken":  totp_token,
+            },
+        )
+        data2 = body2.get("data", body2)
+        jwt   = (
+            data2.get("token")
+            or data2.get("jwt")
+            or data2.get("access_token")
+            or data2.get("accessToken")
+        )
+        if not jwt:
+            raise RuntimeError(f"[fiserv][pw] No JWT in authenticate response: {body2}")
 
-            # Step 2 — generate OTP
-            # Strip spaces/dashes/padding that some portals add for readability, then uppercase
-            import re as _re
-            secret_b32 = _re.sub(r'[\s\-=]', '', secret).upper()
-            otp_code = pyotp.TOTP(secret_b32).now()
-            logger.debug(f"[{self.name}] OTP generated: {otp_code}")
-
-            # Step 3 — authenticate
-            r2 = client.post(
-                f"{base}/api/Users/authenticate",
-                json={
-                    "username":   username,
-                    "password":   password,
-                    "otp":        otp_code,
-                    "deviceName": username,
-                    "totpToken":  totp_token,
-                },
-                headers=self._browser_headers(base),
-                timeout=30,
-            )
-            logger.debug(f"[{self.name}] authenticate status={r2.status_code} body={r2.text[:500]}")
-            if r2.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"[fiserv] authenticate failed: {r2.status_code} {r2.text[:200]}"
-                )
-
-            body2 = r2.json() if r2.content else {}
-            data2 = body2.get("data", body2)
-            jwt   = (
-                data2.get("token")
-                or data2.get("jwt")
-                or data2.get("access_token")
-                or data2.get("accessToken")
-            )
-            if not jwt:
-                raise RuntimeError(
-                    f"[fiserv] No JWT in authenticate response: {body2}"
-                )
-
-        existing = self.session_store.get() or {}
-        existing["jwt"] = jwt
-        self.session_store.save(existing, expires_in_hours=8)
         self.jwt = jwt
-        logger.info(f"[{self.name}] TOTP login successful — JWT cached (8h)")
+        logger.info(f"[{self.name}] TOTP login successful")
         return True
 
     # ── List files ────────────────────────────────────────────────────────────
@@ -230,13 +269,12 @@ class FiservAgent(AgentBase):
         if not self.jwt:
             raise RuntimeError("[fiserv] JWT not set — call login() first")
 
-        base     = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
-        url      = f"{base}/settlement/Settlement/SettlementFileList"
+        url      = f"{self._base}/settlement/Settlement/SettlementFileList"
         from datetime import timedelta as _td
         end_date = self.period_to.date() + _td(days=1)
         from_str = f"{self.period_from.date().isoformat()}T03:00:00.000Z"
         to_str   = f"{end_date.isoformat()}T03:00:00.000Z"
-        headers = self._browser_headers(base, {"Authorization": f"Bearer {self.jwt}"})
+        auth     = {"Authorization": f"Bearer {self.jwt}"}
 
         logger.info(
             f"[{self.name}] Fetching file list {self.period_from.date()} → {self.period_to.date()}..."
@@ -246,66 +284,42 @@ class FiservAgent(AgentBase):
         items     = []
         skip      = 0
 
-        with cffi_requests.Session(impersonate="chrome124") as client:
-            while True:
-                r = client.post(
-                    url,
-                    json={
-                        "From":              from_str,
-                        "To":                to_str,
-                        "MerchantDocuments": [""],
-                        "MerchantNumbers":   [],
-                        "DateRangeType":     "SETT_DATE",
-                        "Currency":          "",
-                        "Skip":              skip,
-                        "Take":              PAGE_SIZE,
-                    },
-                    headers=headers,
-                    timeout=30,
+        while True:
+            body = self._pw_post(
+                url,
+                {
+                    "From":              from_str,
+                    "To":                to_str,
+                    "MerchantDocuments": [""],
+                    "MerchantNumbers":   [],
+                    "DateRangeType":     "SETT_DATE",
+                    "Currency":          "",
+                    "Skip":              skip,
+                    "Take":              PAGE_SIZE,
+                },
+                extra_headers=auth,
+            )
+            page = (
+                body if isinstance(body, list)
+                else body.get("data", body.get("files", []))
+            )
+
+            for entry in page:
+                logger.debug(f"[{self.name}] entry fields: {list(entry.keys()) if isinstance(entry, dict) else entry}")
+                name = (
+                    entry.get("aggregatorHeaderId")
+                    or entry.get("fileName")
+                    or entry.get("name")
+                    or ""
                 )
+                if name:
+                    items.append({"name": name})
 
-                if r.status_code == 401:
-                    self.session_store.invalidate()
-                    raise SessionExpired("[fiserv] JWT expired — re-login needed")
+            logger.debug(f"[{self.name}] Page skip={skip}: {len(page)} record(s)")
 
-                if r.status_code != 200:
-                    logger.error(
-                        f"[{self.name}] list_files error — status={r.status_code} "
-                        f"url={url} skip={skip}\n"
-                        f"response: {r.text[:500]}"
-                    )
-                    raise RuntimeError(
-                        f"[fiserv] list_files API error: {r.status_code} {r.text[:300]}"
-                    )
-
-                try:
-                    body = r.json() if r.content else {}
-                except ValueError:
-                    # Fiserv sometimes returns 200 with non-JSON (HTML) when the JWT is stale
-                    logger.warning(f"[{self.name}] Non-JSON response despite 200 — invalidating JWT cache\n{r.text[:300]}")
-                    self.session_store.invalidate()
-                    raise SessionExpired("[fiserv] JWT stale — got non-JSON on 200")
-                page = (
-                    body if isinstance(body, list)
-                    else body.get("data", body.get("files", []))
-                )
-
-                for entry in page:
-                    logger.debug(f"[{self.name}] entry fields: {list(entry.keys()) if isinstance(entry, dict) else entry}")
-                    name = (
-                        entry.get("aggregatorHeaderId")
-                        or entry.get("fileName")
-                        or entry.get("name")
-                        or ""
-                    )
-                    if name:
-                        items.append({"name": name})
-
-                logger.debug(f"[{self.name}] Page skip={skip}: {len(page)} record(s)")
-
-                if len(page) < PAGE_SIZE:
-                    break
-                skip += PAGE_SIZE
+            if len(page) < PAGE_SIZE:
+                break
+            skip += PAGE_SIZE
 
         logger.info(f"[{self.name}] {len(items)} file(s) found")
         return items
@@ -325,35 +339,14 @@ class FiservAgent(AgentBase):
             logger.error(f"[{self.name}] download() called with empty name")
             return None
 
-        base    = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
-        url     = f"{base}/settlement/Settlement/downloadUploadedFile"
-        dest    = self.destination / self.rename(name)
-        headers = self._browser_headers(base, {"Authorization": f"Bearer {self.jwt}"})
+        url  = f"{self._base}/settlement/Settlement/downloadUploadedFile"
+        dest = self.destination / self.rename(name)
+        auth = {"Authorization": f"Bearer {self.jwt}"}
 
         logger.info(f"[{self.name}] Downloading: {name} → {dest.name}")
-        logger.debug(f"[{self.name}] POST {url} body={{'fileName': '{name}'}}")
         try:
-            with cffi_requests.Session(impersonate="chrome124") as client:
-                r = client.post(url, json={"fileName": name}, headers=headers, timeout=120)
+            content = self._pw_bytes(url, {"fileName": name}, extra_headers=auth)
 
-            logger.debug(
-                f"[{self.name}] Response: status={r.status_code} "
-                f"content-type={r.headers.get('content-type', '?')} "
-                f"size={len(r.content):,} bytes"
-            )
-
-            if r.status_code == 401:
-                self.session_store.invalidate()
-                raise SessionExpired("[fiserv] JWT expired during download")
-            if r.status_code != 200:
-                logger.error(
-                    f"[{self.name}] Download failed — status={r.status_code} file={name}\n"
-                    f"  URL: {url}\n"
-                    f"  Body: {r.text[:500] or '(empty)'}"
-                )
-                return None
-
-            content = r.content
             if not content:
                 logger.error(f"[{self.name}] Empty response body for {name}")
                 return None
@@ -365,8 +358,6 @@ class FiservAgent(AgentBase):
             logger.info(f"[{self.name}] Saved: {dest} ({len(content):,} bytes)")
             return dest
 
-        except SessionExpired:
-            raise
         except Exception as e:
             logger.error(f"[{self.name}] Download exception for {name}: {type(e).__name__}: {e}")
             return None
