@@ -44,10 +44,11 @@ class FiservAgent(AgentBase):
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self._base    = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
-        self._pw      = None
-        self._browser = None
-        self._pw_ctx  = None
+        self._base     = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
+        self._pw       = None
+        self._browser  = None
+        self._pw_ctx   = None
+        self._api_page = None   # kept open after warm-up; all fetch() calls run through it
         self.jwt: Optional[str] = None
 
     # ── Intervention — never needed in TOTP mode ──────────────────────────────
@@ -63,6 +64,11 @@ class FiservAgent(AgentBase):
 
     def logout(self):
         self.jwt = None
+        if self._api_page:
+            try:
+                self._api_page.close()
+            except Exception:
+                pass
         if self._pw_ctx:
             try:
                 self._pw_ctx.close()
@@ -78,7 +84,7 @@ class FiservAgent(AgentBase):
                 self._pw.stop()
             except Exception:
                 pass
-        self._pw_ctx = self._browser = self._pw = None
+        self._api_page = self._pw_ctx = self._browser = self._pw = None
 
     def _browser_headers(self, extra: dict = None) -> dict:
         headers = {
@@ -103,8 +109,9 @@ class FiservAgent(AgentBase):
 
     def _ensure_pw_ctx(self):
         """Creates the shared Playwright browser context once per job.
-        The warm-up GET lets Radware run its JS challenge and set cookies
-        that are reused by all subsequent API calls in the same context."""
+        The warm-up GET lets Radware run its JS challenge and set cookies.
+        The page is kept open so all subsequent API calls go through
+        page.evaluate(fetch()), using Chrome's real TLS fingerprint."""
         if self._pw_ctx is not None:
             return
 
@@ -125,17 +132,16 @@ class FiservAgent(AgentBase):
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        page = self._pw_ctx.new_page()
+        self._api_page = self._pw_ctx.new_page()
         if stealth_sync:
             try:
-                stealth_sync(page)
+                stealth_sync(self._api_page)
             except Exception as _e:
                 logger.warning(f"[{self.name}] playwright_stealth unavailable (non-fatal): {_e}")
         try:
-            page.goto(self._base, wait_until="networkidle", timeout=30_000)
+            self._api_page.goto(self._base, wait_until="networkidle", timeout=30_000)
         except Exception:
-            page.goto(self._base, wait_until="domcontentloaded", timeout=30_000)
-        page.close()
+            self._api_page.goto(self._base, wait_until="domcontentloaded", timeout=30_000)
         logger.info(f"[{self.name}] Playwright context ready (Radware warm-up done)")
 
     def _ensure_chromium(self):
@@ -157,17 +163,23 @@ class FiservAgent(AgentBase):
         logger.info(f"[{self.name}] Chromium installed successfully")
 
     def _pw_post(self, url: str, payload: dict, extra_headers: dict = None) -> dict:
-        """POST via shared Playwright context — returns parsed JSON."""
+        """POST via page.evaluate(fetch) — runs through Chrome's TLS stack, not Playwright's HTTP client."""
         self._ensure_pw_ctx()
-        resp = self._pw_ctx.request.post(
-            url,
-            data=_json.dumps(payload),
-            headers=self._browser_headers(extra_headers),
+        headers = self._browser_headers(extra_headers)
+        result = self._api_page.evaluate(
+            """async ({url, body, headers}) => {
+                const r = await fetch(url, {
+                    method: 'POST', headers, body, credentials: 'include'
+                });
+                return {status: r.status, text: await r.text()};
+            }""",
+            {"url": url, "body": _json.dumps(payload), "headers": headers},
         )
-        text = resp.text()
-        logger.debug(f"[{self.name}] POST {url} → status={resp.status} body={text[:300]}")
-        if resp.status not in (200, 201):
-            raise RuntimeError(f"[fiserv][pw] HTTP {resp.status}: {text[:200]}")
+        status = result["status"]
+        text   = result["text"]
+        logger.debug(f"[{self.name}] POST {url} → status={status} body={text[:300]}")
+        if status not in (200, 201):
+            raise RuntimeError(f"[fiserv][pw] HTTP {status}: {text[:200]}")
         if "Radware Bot Manager" in text or ("captcha" in text.lower() and "<html" in text.lower()):
             raise RuntimeError("[fiserv][pw] Radware still blocking — check stealth setup")
         try:
@@ -176,22 +188,32 @@ class FiservAgent(AgentBase):
             raise RuntimeError(f"[fiserv][pw] Non-JSON response: {text[:300]}")
 
     def _pw_bytes(self, url: str, payload: dict, extra_headers: dict = None) -> bytes:
-        """POST via shared Playwright context — returns raw bytes (for file downloads)."""
+        """POST via page.evaluate(fetch) — returns raw bytes (base64-bridged from JS ArrayBuffer)."""
+        import base64 as _b64
         self._ensure_pw_ctx()
-        resp = self._pw_ctx.request.post(
-            url,
-            data=_json.dumps(payload),
-            headers=self._browser_headers(extra_headers),
+        headers = self._browser_headers(extra_headers)
+        result = self._api_page.evaluate(
+            """async ({url, body, headers}) => {
+                const r = await fetch(url, {
+                    method: 'POST', headers, body, credentials: 'include'
+                });
+                if (!r.ok) return {status: r.status, error: await r.text(), data: null};
+                const buf = await r.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                let bin = '';
+                for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+                return {status: r.status, error: null, data: btoa(bin)};
+            }""",
+            {"url": url, "body": _json.dumps(payload), "headers": headers},
         )
-        if resp.status == 401:
-            raise RuntimeError("[fiserv][pw] JWT expired (401)")
-        if resp.status != 200:
-            raise RuntimeError(f"[fiserv][pw] Download HTTP {resp.status}: {resp.text()[:200]}")
-        content = resp.body()
+        status = result["status"]
+        if result.get("error") is not None:
+            if status == 401:
+                raise RuntimeError("[fiserv][pw] JWT expired (401)")
+            raise RuntimeError(f"[fiserv][pw] Download HTTP {status}: {result['error'][:200]}")
+        content = _b64.b64decode(result["data"])
         logger.debug(
-            f"[{self.name}] POST {url} → status={resp.status} "
-            f"content-type={resp.headers.get('content-type', '?')} "
-            f"size={len(content):,} bytes"
+            f"[{self.name}] POST {url} → status={status} size={len(content):,} bytes"
         )
         return content
 
