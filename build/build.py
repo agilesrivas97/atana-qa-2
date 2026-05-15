@@ -117,6 +117,8 @@ def main():
 
         # Browser automation
         "--hidden-import", "playwright",
+        "--hidden-import", "playwright_stealth",
+        "--collect-data", "playwright_stealth",
 
         # System tray + icon generation
         "--hidden-import", "pystray",
@@ -130,11 +132,6 @@ def main():
         "--hidden-import", "pyotp",
         "--hidden-import", "pyzbar",
         "--hidden-import", "pyzbar.pyzbar",
-
-        # Browser TLS impersonation (Fiserv bot-protection bypass)
-        "--hidden-import", "curl_cffi",
-        "--hidden-import", "curl_cffi.requests",
-        "--collect-all", "curl_cffi",
 
         # tkinter is bundled with Python — no hidden import needed
 

@@ -114,7 +114,9 @@ class FiservAgent(AgentBase):
         except ImportError:
             stealth_sync = None
 
-        self._pw      = sync_playwright().start()
+        self._pw = sync_playwright().start()
+        if not Path(self._pw.chromium.executable_path).exists():
+            self._ensure_chromium()
         self._browser = self._pw.chromium.launch(headless=True)
         self._pw_ctx  = self._browser.new_context(
             user_agent=(
@@ -125,13 +127,34 @@ class FiservAgent(AgentBase):
         )
         page = self._pw_ctx.new_page()
         if stealth_sync:
-            stealth_sync(page)
+            try:
+                stealth_sync(page)
+            except Exception as _e:
+                logger.warning(f"[{self.name}] playwright_stealth unavailable (non-fatal): {_e}")
         try:
             page.goto(self._base, wait_until="networkidle", timeout=30_000)
         except Exception:
             page.goto(self._base, wait_until="domcontentloaded", timeout=30_000)
         page.close()
         logger.info(f"[{self.name}] Playwright context ready (Radware warm-up done)")
+
+    def _ensure_chromium(self):
+        """Installs Chromium via the bundled playwright driver if not present.
+        Works both in development (plain Python) and in PyInstaller bundles."""
+        logger.info(f"[{self.name}] Chromium not found — installing (first run, ~15s)...")
+        import subprocess
+        try:
+            from playwright._impl._driver import compute_driver_executable
+            driver, env = compute_driver_executable()
+            result = subprocess.run(
+                [driver, "install", "chromium"],
+                env=env, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr[:500])
+        except Exception as e:
+            raise RuntimeError(f"[fiserv] Could not install Chromium: {e}")
+        logger.info(f"[{self.name}] Chromium installed successfully")
 
     def _pw_post(self, url: str, payload: dict, extra_headers: dict = None) -> dict:
         """POST via shared Playwright context — returns parsed JSON."""
