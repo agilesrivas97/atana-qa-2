@@ -152,7 +152,7 @@ class MercadoPagoAgent(AgentBase):
                 continue
 
             existing = self._find_in_list(
-                list_resp.json(), begin_str, end_str
+                list_resp.json() if list_resp.content else [], begin_str, end_str
             )
             if existing:
                 status_mp = existing.get("status")
@@ -223,7 +223,7 @@ class MercadoPagoAgent(AgentBase):
                 )
                 continue
 
-            data      = resp.json()
+            data      = resp.json() if resp.content else {}
             report_id = data.get("id")
             logger.info(
                 f"[{self.name}] [{alias}] Report created: "
@@ -429,7 +429,7 @@ class MercadoPagoAgent(AgentBase):
                 time.sleep(self.poll_interval)
                 continue
 
-            task      = task_resp.json()
+            task      = task_resp.json() if task_resp.content else {}
             status    = task.get("status", "")
             file_name = task.get("file_name")
 

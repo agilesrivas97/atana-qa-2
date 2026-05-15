@@ -113,7 +113,7 @@ class FiservAgent(AgentBase):
         logger.debug(f"[{self.name}] password present: {bool(password)}, len={len(password)}")
         logger.info(f"[{self.name}] TOTP login — requesting OTP challenge...")
 
-        with cffi_requests.Session(impersonate="chrome120") as client:
+        with cffi_requests.Session(impersonate="chrome124") as client:
             # Step 1 — request OTP challenge
             r1 = client.post(
                 f"{base}/api/Users/requestOtp",
@@ -132,8 +132,15 @@ class FiservAgent(AgentBase):
                 raise RuntimeError(
                     f"[fiserv] requestOtp failed: {r1.status_code} {r1.text[:200]}"
                 )
+            if "Radware Bot Manager" in r1.text or "captcha" in r1.text.lower():
+                raise RuntimeError(
+                    "[fiserv] Blocked by Radware Bot Manager CAPTCHA — IP may be flagged"
+                )
 
-            body1      = r1.json() if r1.content else {}
+            try:
+                body1 = r1.json() if r1.content else {}
+            except ValueError:
+                raise RuntimeError(f"[fiserv] Non-JSON on requestOtp (status 200): {r1.text[:300]}")
             data1      = body1.get("data", body1)
             totp_token = data1.get("totpToken") or data1.get("token") or ""
             logger.debug(f"[{self.name}] OTP challenge received — totpToken present: {bool(totp_token)}, len={len(totp_token)}")
@@ -217,7 +224,7 @@ class FiservAgent(AgentBase):
         items     = []
         skip      = 0
 
-        with cffi_requests.Session(impersonate="chrome120") as client:
+        with cffi_requests.Session(impersonate="chrome124") as client:
             while True:
                 r = client.post(
                     url,
@@ -249,7 +256,13 @@ class FiservAgent(AgentBase):
                         f"[fiserv] list_files API error: {r.status_code} {r.text[:300]}"
                     )
 
-                body = r.json() if r.content else {}
+                try:
+                    body = r.json() if r.content else {}
+                except ValueError:
+                    # Fiserv sometimes returns 200 with non-JSON (HTML) when the JWT is stale
+                    logger.warning(f"[{self.name}] Non-JSON response despite 200 — invalidating JWT cache\n{r.text[:300]}")
+                    self.session_store.invalidate()
+                    raise SessionExpired("[fiserv] JWT stale — got non-JSON on 200")
                 page = (
                     body if isinstance(body, list)
                     else body.get("data", body.get("files", []))
@@ -301,7 +314,7 @@ class FiservAgent(AgentBase):
         logger.info(f"[{self.name}] Downloading: {name} → {dest.name}")
         logger.debug(f"[{self.name}] POST {url} body={{'fileName': '{name}'}}")
         try:
-            with cffi_requests.Session(impersonate="chrome120") as client:
+            with cffi_requests.Session(impersonate="chrome124") as client:
                 r = client.post(url, json={"fileName": name}, headers=headers, timeout=120)
 
             logger.debug(
