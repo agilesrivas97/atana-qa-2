@@ -327,7 +327,7 @@ def _cfg_prisma(conn):
     _update_agent(conn, "prisma", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "{merchant}_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 3, "retry_interval_min": 15,
         "schedule_hour": hour, "schedule_minute": minute,
     })
@@ -351,7 +351,7 @@ def _cfg_cabal(conn):
     _update_agent(conn, "cabal", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "CABAL_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 3, "retry_interval_min": 15,
         "schedule_hour": hour, "schedule_minute": minute,
     })
@@ -388,7 +388,7 @@ def _cfg_naranjax(conn):
     _update_agent(conn, "naranjax", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "NX_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 2, "retry_interval_min": 30,
         "schedule_hour": hour, "schedule_minute": minute,
         "extra_config": json.dumps(extra, ensure_ascii=False),
@@ -423,7 +423,7 @@ def _cfg_fiserv(conn):
     _update_agent(conn, "fiserv", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "FISERV_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 2, "retry_interval_min": 30,
         "portal_url": "https://merchantcenter.fiservapp.com",
         "schedule_hour": hour, "schedule_minute": minute,
@@ -449,7 +449,7 @@ def _cfg_amex(conn):
     _update_agent(conn, "amex", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "AMEX_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 3, "retry_interval_min": 10,
         "schedule_hour": hour, "schedule_minute": minute,
     })
@@ -475,7 +475,7 @@ def _cfg_getnet(conn):
     _update_agent(conn, "getnet", {
         "enabled": 1 if enable else 0, "username": username,
         "password_enc": enc_bytes(password), "destination_folder": dest,
-        "rename_pattern": "GETNET_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 1, "retry_interval_min": 0,
         "schedule_hour": hour, "schedule_minute": minute,
         "extra_config": json.dumps(extra, ensure_ascii=False),
@@ -518,7 +518,7 @@ def _cfg_mercadopago(conn):
         "enabled": 1 if enable else 0,
         "username": None, "password_enc": None,
         "destination_folder": dest,
-        "rename_pattern": "MP_{alias}_{date}.{ext}",
+        "rename_pattern": "",
         "max_retries": 5, "retry_interval_min": 2,
         "schedule_hour": hour, "schedule_minute": minute,
         "extra_config": json.dumps(extra, ensure_ascii=False),

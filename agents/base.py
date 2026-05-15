@@ -27,7 +27,7 @@ class AgentBase(ABC):
     def __init__(self, config: dict):
         self.config        = config["agents"][self.name]
         self.destination   = self._validated_destination(self.config["destination_folder"])
-        self.pattern       = self.config.get("rename_pattern", "{original}")
+        self.pattern       = self.config.get("rename_pattern") or ""
         self.max_retries   = self.config.get("max_retries", 3)
         self.retry_interval = self.config.get("retry_interval_min", 15)
         self.destination.mkdir(parents=True, exist_ok=True)
@@ -226,11 +226,15 @@ class AgentBase(ABC):
         Renames a file according to the configured pattern.
         Agents can override to extract provider-specific data from the filename.
         """
+        if not self.pattern:
+            return original_name
+
         data = {
-            "original": original_name,
-            "ext":      Path(original_name).suffix.lstrip("."),
-            "date":     self.reference_date.strftime("%Y-%m-%d") if hasattr(self, "reference_date") else "",
-            "merchant": self.config.get("username") or "",
+            "original":       original_name,
+            "originfilename": Path(original_name).stem,
+            "ext":            Path(original_name).suffix.lstrip("."),
+            "date":           self.reference_date.strftime("%Y-%m-%d") if hasattr(self, "reference_date") else "",
+            "merchant":       self.config.get("username") or "",
         }
         if extra_data:
             data.update(extra_data)

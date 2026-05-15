@@ -41,7 +41,7 @@ import time
 import httpx
 from loguru import logger
 
-from dispatcher import db, notifier
+from dispatcher import db
 from dispatcher.version import APP_VERSION
 
 SERVICE_NAME = "AtanaDispatcher"
@@ -327,11 +327,6 @@ def check_for_update():
             os.rename(tmp_exe, exe_path)
 
             logger.success("[autoupdater] Swap successful. Terminating process to trigger NSSM restart...")
-            notifier.notify(
-                "dispatcher", "agent_updated",
-                f"Version {remote_version} instalada correctamente — servicio reiniciando..."
-            )
-            notifier.flush()
             time.sleep(1)
             os._exit(0)
             
