@@ -105,16 +105,16 @@ class AgentBase(ABC):
         """
         self.reference_date = (requested_at or datetime.now()).date()
 
-        from datetime import datetime as dt, time as _time, timedelta
+        from datetime import datetime as dt, time as dtime, timedelta
         yesterday = self.reference_date - timedelta(days=1)
-        self.period_to = dt.combine(yesterday, _time(23, 59, 59))
+        self.period_to = dt.combine(yesterday, dtime(23, 59, 59))
 
         last_end = db.get_provider_last_period_end(self.name)
         if last_end:
             # Start from the beginning of the day after the last covered period
-            self.period_from = dt.combine(last_end.date() + timedelta(days=1), _time(0, 0, 0))
+            self.period_from = dt.combine(last_end.date() + timedelta(days=1), dtime(0, 0, 0))
         else:
-            self.period_from = dt.combine(yesterday, _time(0, 0, 0))
+            self.period_from = dt.combine(yesterday, dtime(0, 0, 0))
 
         result = {
             "ok":         False,
