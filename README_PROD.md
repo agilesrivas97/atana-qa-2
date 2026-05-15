@@ -110,3 +110,50 @@ Get-WmiObject Win32_Process | Where-Object {
 O bien desde el **Administrador de Tareas** → pestaña **Detalles** → buscar `atana_dispatcher.exe` con `--tray` en la línea de comandos → clic derecho → **Finalizar tarea**.
 
 > El tray volverá a iniciarse automáticamente en el próximo inicio de sesión del usuario.
+
+---
+
+## 6. Patrón de renombre de archivos
+
+Cada agente puede renombrar los archivos descargados antes de guardarlos.
+El patrón se configura en la tabla `agent_config` (campo `rename_pattern`).
+
+**Si el patrón está vacío**, el archivo se guarda con su nombre original tal como lo devuelve el portal.
+
+### Variables disponibles
+
+| Variable | Descripción | Ejemplo |
+|---|---|---|
+| `{original}` | Nombre completo original (con extensión) | `settle_20260515.csv` |
+| `{originfilename}` | Nombre original **sin extensión** | `settle_20260515` |
+| `{ext}` | Extensión sin punto | `csv` |
+| `{date}` | Fecha de referencia del job (`YYYY-MM-DD`) | `2026-05-15` |
+| `{merchant}` | Usuario configurado para el agente | `acme_corp` |
+
+### Ejemplos de patrones
+
+| Patrón | Archivo resultante |
+|---|---|
+| *(vacío)* | `settle_20260515.csv` (nombre original) |
+| `FISERV_{date}.{ext}` | `FISERV_2026-05-15.csv` |
+| `FISERV_{originfilename}.{ext}` | `FISERV_settle_20260515.csv` |
+| `{merchant}_{date}.{ext}` | `acme_corp_2026-05-15.csv` |
+| `liquidacion_{date}_{originfilename}.{ext}` | `liquidacion_2026-05-15_settle_20260515.csv` |
+
+### Configurar el patrón
+
+Actualizar directamente en SQL Server:
+
+```sql
+UPDATE agent_config
+SET rename_pattern = 'FISERV_{originfilename}.{ext}'
+WHERE provider = 'fiserv';
+```
+
+O dejarlo vacío para usar el nombre original:
+
+```sql
+UPDATE agent_config
+SET rename_pattern = ''
+WHERE provider = 'fiserv';
+```
