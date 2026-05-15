@@ -72,6 +72,25 @@ class FiservAgent(AgentBase):
     def logout(self):
         self.jwt = None
 
+    def _browser_headers(self, base: str, extra: dict = None) -> dict:
+        headers = {
+            "Accept":             "application/json, text/plain, */*",
+            "Accept-Language":    "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding":    "gzip, deflate, br",
+            "Origin":             base,
+            "Referer":            base + "/",
+            "sec-ch-ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile":   "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Sec-Fetch-Dest":     "empty",
+            "Sec-Fetch-Mode":     "cors",
+            "Sec-Fetch-Site":     "same-origin",
+            "Content-Type":       "application/json",
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
     # ── TOTP authentication ───────────────────────────────────────────────────
 
     def _login_totp(self) -> bool:
@@ -114,6 +133,12 @@ class FiservAgent(AgentBase):
         logger.info(f"[{self.name}] TOTP login — requesting OTP challenge...")
 
         with cffi_requests.Session(impersonate="chrome124") as client:
+            try:
+                client.get(base + "/", timeout=15)
+                logger.debug(f"[{self.name}] Warm-up GET {base}/ completed")
+            except Exception as _e:
+                logger.debug(f"[{self.name}] Warm-up GET failed (non-fatal): {_e}")
+
             # Step 1 — request OTP challenge
             r1 = client.post(
                 f"{base}/api/Users/requestOtp",
@@ -124,7 +149,7 @@ class FiservAgent(AgentBase):
                     "phoneNumber":        "",
                     "typeAuthentication": "TOTP",
                 },
-                headers={"Content-Type": "application/json"},
+                headers=self._browser_headers(base),
                 timeout=30,
             )
             logger.debug(f"[{self.name}] requestOtp status={r1.status_code} body={r1.text[:300]}")
@@ -162,7 +187,7 @@ class FiservAgent(AgentBase):
                     "deviceName": username,
                     "totpToken":  totp_token,
                 },
-                headers={"Content-Type": "application/json"},
+                headers=self._browser_headers(base),
                 timeout=30,
             )
             logger.debug(f"[{self.name}] authenticate status={r2.status_code} body={r2.text[:500]}")
@@ -211,10 +236,7 @@ class FiservAgent(AgentBase):
         end_date = self.period_to.date() + _td(days=1)
         from_str = f"{self.period_from.date().isoformat()}T03:00:00.000Z"
         to_str   = f"{end_date.isoformat()}T03:00:00.000Z"
-        headers   = {
-            "Authorization": f"Bearer {self.jwt}",
-            "Content-Type":  "application/json",
-        }
+        headers = self._browser_headers(base, {"Authorization": f"Bearer {self.jwt}"})
 
         logger.info(
             f"[{self.name}] Fetching file list {self.period_from.date()} → {self.period_to.date()}..."
@@ -306,10 +328,7 @@ class FiservAgent(AgentBase):
         base    = self.config.get("api_base_url", API_BASE_URL).rstrip("/")
         url     = f"{base}/settlement/Settlement/downloadUploadedFile"
         dest    = self.destination / self.rename(name)
-        headers = {
-            "Authorization": f"Bearer {self.jwt}",
-            "Content-Type":  "application/json",
-        }
+        headers = self._browser_headers(base, {"Authorization": f"Bearer {self.jwt}"})
 
         logger.info(f"[{self.name}] Downloading: {name} → {dest.name}")
         logger.debug(f"[{self.name}] POST {url} body={{'fileName': '{name}'}}")
