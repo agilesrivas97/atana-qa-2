@@ -164,7 +164,7 @@ class AgentBase(ABC):
                         result["downloaded"].append(str(path))
                         logger.info(f"[{self.name}] Downloaded: {path.name}")
                     else:
-                        result["errors"].append(f"Could not download: {name}")
+                        raise RuntimeError(f"Could not download: {name}")
 
                 result["ok"] = True
                 break
