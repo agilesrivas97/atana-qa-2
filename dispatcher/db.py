@@ -471,8 +471,6 @@ def _decode_agent_row(row: dict) -> dict:
         decrypted_pwd = _decrypt(raw)
         cfg["password"] = decrypted_pwd
         logger.debug(f"[db] [{provider}] password_enc: {len(raw)} bytes → decrypted ok={bool(decrypted_pwd)}")
-    else:
-        logger.debug(f"[db] [{provider}] password_enc is NULL — password will be empty")
     cfg.pop("password_enc", None)
 
     # Parse and merge extra_config JSON

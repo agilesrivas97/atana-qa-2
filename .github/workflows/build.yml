@@ -10,6 +10,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout
@@ -20,9 +22,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Write-Host "Downloading ffmpeg from $url ..."
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $bin) { Write-Error "ffmpeg.exe not found in archive"; exit 1 }
+          New-Item -ItemType Directory -Force -Path tools/ffmpeg | Out-Null
+          Copy-Item $bin.FullName tools/ffmpeg/ffmpeg.exe
+          Copy-Item (Join-Path $bin.DirectoryName "ffprobe.exe") tools/ffmpeg/ffprobe.exe
+          Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
+          Write-Host "ffmpeg.exe: $((Get-Item 'tools/ffmpeg/ffmpeg.exe').Length) bytes"
+          Write-Host "ffprobe.exe: $((Get-Item 'tools/ffmpeg/ffprobe.exe').Length) bytes"
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip install openai-whisper
           playwright install chromium
 
       - name: Build exe

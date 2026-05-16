@@ -44,6 +44,13 @@ tools/dist/
 tools/_build_work/
 tools/_build_spec/
 
+# ── ffmpeg — binarios para empaquetar con PyInstaller (cubiertos por *.exe) ──
+# Descargar de https://ffmpeg.org/download.html → copiar a tools/ffmpeg/
+# No se versionan por tamaño (~70MB). El .exe del cliente los lleva empaquetados.
+# tools/ffmpeg/ffmpeg.exe   ← ya ignorado por *.exe arriba
+# tools/ffmpeg/ffprobe.exe  ← ya ignorado por *.exe arriba
+# tools/ffmpeg/.gitkeep     ← versionado (marca que la carpeta existe)
+
 # ── Firmas de agentes (generadas por build/sign.py) ───────────────────────────
 agents/*.sig
 
@@ -64,3 +71,7 @@ dist/
 
 
 *.jpeg
+setup_dev_fiserv.py 
+dev_setup.sh
+fiserv_dev_profile/
+tools/ffmpeg/

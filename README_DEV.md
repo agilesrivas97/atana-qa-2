@@ -5,70 +5,104 @@ Este documento es una guía destinada a programadores que desean mantener o expa
 ---
 
 ## 1. Stack Tecnológico
-- **Lenguaje:** Python 3.11+
-- **BD Motor:** SQL Server (On-Premises, Azure, o local vía SSMS)
-- **ODBC:** ODBC Driver 18 for SQL Server (requerido para las interfaces de conexión).
+- **Lenguaje:** Python 3.12
+- **BD Motor:** SQL Server (On-Premises, Azure, o local vía Docker)
+- **ODBC:** ODBC Driver 18 for SQL Server (requerido para las interfaces de conexión)
 - **Frameworks de Agentes:**
-  - `httpx`: Llamadas REST API directas.
-  - `playwright` (Chromium): Automatización e interactividad en portales sin API nativa.
-- **Orquestador y Schedulers:** Generado con `APScheduler`.
+  - `httpx` / `curl_cffi`: Llamadas REST API directas
+  - `playwright` (Chromium): Automatización e interactividad en portales sin API nativa
+- **Orquestador y Schedulers:** `APScheduler`
+- **Audio reCAPTCHA:** `openai-whisper` (offline, primario) + `SpeechRecognition` (Google Speech, fallback) — usan `ffmpeg` para convertir el audio del captcha de MP3 a WAV antes de transcribirlo. `ffmpeg` va empaquetado dentro del `.exe` y no requiere instalación en el cliente.
 
-## 2. Inicializar entorno de desarrollo
+## 2. Inicializar entorno de desarrollo en Mac (recomendado)
 
-Clona el repositorio desde git.
+El script `dev_setup.sh` automatiza todo el setup desde cero: verifica prerequisitos, levanta SQL Server en Docker, carga el schema, crea el venv con Python 3.12, instala dependencias y corre el wizard de configuración de Fiserv.
+
+```bash
+chmod +x dev_setup.sh && ./dev_setup.sh
+```
+
+Al finalizar, el script muestra el comando exacto para correr el agente.
+
+### Setup manual (alternativa)
+
+Clona el repositorio y crea el ambiente virtual con **Python 3.12** (no 3.13/3.14 — las dependencias nativas aún no tienen wheels para esas versiones):
 
 ```bash
 git clone <url-del-repo>
 cd atana-agents
+
+# Mac
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+# Windows
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-Crea tu ambiente virtual en Python:
-```bash
-python -m venv venv
-# en windows:
-venv\Scripts\activate
+Instala dependencias y navegadores:
 
-# instala librerias e instala los navegadores de Playwright:
+```bash
 pip install -r requirements.txt
+pip install openai-whisper          # recomendado: reCAPTCHA offline sin API key
 playwright install chromium
 ```
 
 ## 3. Base de Datos en Modo Desarrollo
 
-Debes levantar tu SQL Server (vía Docker `mcr.microsoft.com/mssql/server` o directamente instalado).
-Una vez que el motor de SQL Server esté corriendo y cuentes con acceso (ej. como usuario `sa`), no necesitas ejecutar scripts SQL a mano. 
+Levanta SQL Server vía Docker:
 
-La forma más rápida de inicializar tu entorno local es ejecutando el Wizard Gráfico que automatiza la creación del archivo `config.json`, la inyección del DDL (tablas y vistas) y la generación de las claves criptográficas Fernet:
+```bash
+docker run -e "ACCEPT_EULA=Y" -e "SA_PASSWORD=AtanaDev1234!" \
+           -p 1433:1433 --name atana-sql -d \
+           mcr.microsoft.com/mssql/server:2022-latest
+```
+
+Una vez corriendo, puedes usar el Wizard Gráfico para inicializar la DB, generar claves Fernet y crear `config.json`:
 
 ```bash
 python ui/setup_db.py
 ```
 
-Completando esa pantalla con la conexión a tu base local, se generará tu `config.json` automáticamente y tu base de datos quedará estructuralmente lista. 
+O manualmente: ejecutar `schema.sql` en SSMS/sqlcmd, copiar `config.example.json` a `config.json` y generar claves Fernet en `system_config`.
 
-*Tip*: Si pruebas en localhost y tu base de datos auto-genera firmas locales, el Wizard se encargará de inyectar por detrás en el String de Conexión `trust_server_certificate: true` para sortear que la firma de tu cert no sea válida.
+Para configurar el agente Fiserv específicamente (credenciales, perfil de Chrome, carpeta destino):
 
-Si prefieres hacerlo manualmente a bajo nivel, debes ejecutar `schema.sql` en tu SSMS, copiar `config.example.json` a `config.json` e inyectar manualmente las claves de Fernet en la tabla `system_config` generándolas con un print de python.
+```bash
+python setup_dev_fiserv.py
+```
 
 ## 4. Cargando datos de Agentes a la Base (Seeding)
 
-Con la base de datos estructuralmente lista, el ecosistema de orquestación existirá pero de forma inerte (sin perfiles de agentes creados). 
+Con la base de datos estructuralmente lista, usa la **CLI interactiva**:
 
-Para poblar tu motor y probar descargas, debes usar la **CLI interactiva**:
 ```bash
 python tools/setup_db_cli.py
 ```
-> Selecciona uno a uno los agentes y responde en consola. Esta herramienta encriptará internamente los datos sensitivos utilizando el `fernet_key` autogenerado por el Wizard interactivo y los guardará en la base de datos de manera segura.
 
-## 5. Probando Agentes Individuales
-Puedes correr el `dispatcher.main` enfocando a un agente prefigurado para debugear flujos directos.
+> Selecciona uno a uno los agentes y responde en consola. Esta herramienta encriptará internamente los datos sensitivos utilizando el `fernet_key` autogenerado por el Wizard y los guardará en la base de datos de manera segura.
+
+## 5. Corriendo el dispatcher
+
 ```bash
-# esto levantará interactividad sobre el agente target (ej: mercado_pago o fiserv), asumiendo que tienes todo mockeado.
-python -m dispatcher.main
+PYTHONPATH=. python dispatcher/main.py --run --provider fiserv
+```
+
+`PYTHONPATH=.` es obligatorio para que los imports `from dispatcher import ...` y `from shared import ...` resuelvan correctamente desde la raíz del proyecto.
+
+Otros modos disponibles:
+
+```bash
+PYTHONPATH=. python dispatcher/main.py --tui              # dashboard TUI
+PYTHONPATH=. python dispatcher/main.py --tray             # ícono de bandeja
+PYTHONPATH=. python dispatcher/main.py --setup-db         # wizard de configuración
 ```
 
 ## 6. Diseño Arquitectónico (Core Components)
-Revisa `dispatcher/api.py`, ya que el corazón HTTP lo controla allí e incorpora lógica de routing.
-Y `dispatcher/database_factory.py` es tu único punto de inyección para el manejo de credenciales contra SQL Server. No quemes cadenas estáticas de ConnectionStrings en ninguna parte del source.
 
-
+- `dispatcher/api.py` — Servidor HTTP interno (puerto 8765). Controla routing de jobs y status.
+- `dispatcher/database_factory.py` — Único punto de inyección para connection strings a SQL Server. No hardcodear cadenas de conexión en ninguna otra parte.
+- `dispatcher/main.py` — Entry point del dispatcher. Gestiona scheduler, keepalive del browser Fiserv y lifecycle del proceso.
+- `agents/fiserv.py` — Agente Fiserv. El browser Playwright **nunca se cierra entre jobs** (diseño intencional para evadir Radware Bot Manager).
+- `shared/paths.py` — Centraliza todos los paths. Detecta si corre como `.exe` (PyInstaller) o en dev.
