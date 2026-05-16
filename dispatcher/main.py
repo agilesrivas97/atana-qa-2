@@ -266,9 +266,9 @@ def _debug_scheduler_jobs():
 
                     # Fallback: calcular manualmente (SIEMPRE funciona)
                     if not next_run and hasattr(job, "trigger"):
-                        next_run = job.trigger.get_next_fire_time(None, datetime.now())
+                        next_run = job.trigger.get_next_fire_time(None, datetime.now().astimezone())
 
-                    logger.warning(
+                    logger.debug(
                         f"[SCHEDULER] id={job.id} "
                         f"next_run={next_run} "
                         f"trigger={job.trigger}"
@@ -290,7 +290,7 @@ def _sync_scheduler_jobs():
 
     from datetime import datetime
 
-    now = datetime.now()
+    now = datetime.now().astimezone()
 
     for provider, cfg in _config.get("agents", {}).items():
         job_id  = f"schedule_{provider}"
@@ -313,14 +313,14 @@ def _sync_scheduler_jobs():
 
             next_run = trigger.get_next_fire_time(None, now)
 
-            logger.warning(f"[{provider}] Proxima ejecucion programada: {next_run}")
+            logger.debug(f"[{provider}] Proxima ejecucion programada: {next_run}")
 
             run_now = False
 
             # Si ya pasó hoy → decidir ejecución inmediata
             if next_run and next_run.date() > now.date():
                 if not _already_ran_today(provider):
-                    logger.warning(f"[{provider}] Hora ya pasó hoy — ejecución inmediata")
+                    logger.info(f"[{provider}] Hora ya pasó hoy — ejecución inmediata")
                     run_now = True
                 else:
                     logger.info(f"[{provider}] Ya ejecutado hoy — skip ejecución inmediata")
@@ -351,13 +351,14 @@ def _ensure_tray_registry():
     """Keeps HKCU\\...\\Run entry pointing to the current exe path."""
     if os.name != "nt":
         return
+    if _running_as_service():
+        return
     try:
         import winreg
         exe = str(Path(sys.executable).resolve())
-        key = winreg.OpenKey(
+        key = winreg.CreateKey(
             winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0, winreg.KEY_SET_VALUE,
+            r"Software\Microsoft\Windows\CurrentVersion\Run"
         )
         winreg.SetValueEx(key, "AtanaTray", 0, winreg.REG_SZ, f'"{exe}" --tray')
         winreg.CloseKey(key)

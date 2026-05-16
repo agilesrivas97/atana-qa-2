@@ -795,6 +795,7 @@ def main():
     print("  1. Reiniciá el servicio ATANA (services.msc)")
     print("  2. Verificá que los agentes habilitados aparezcan en el tray")
     print("  3. Para modificar la config, volvé a ejecutar este script\n")
+    input("\n  Presiona Enter para salir...")
 
 
 if __name__ == "__main__":
@@ -803,3 +804,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n  Cancelado por el usuario.\n")
         sys.exit(0)
+    except Exception as e:
+        import traceback
+        print(f"\n\n  [ERROR INESPERADO] {e}\n")
+        traceback.print_exc()
+        input("\n  Presiona Enter para salir...")
+        sys.exit(1)

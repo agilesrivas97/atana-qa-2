@@ -307,7 +307,10 @@ class FiservAgent(AgentBase):
         inicio   = time.time()
         mouse_x  = random.randint(300, 600)
         mouse_y  = random.randint(100, 300)
-        page.mouse.move(mouse_x, mouse_y)
+        try:
+            page.mouse.move(mouse_x, mouse_y)
+        except Exception:
+            pass
         scroll_y = 0
 
         while time.time() - inicio < duracion_seg:
@@ -316,40 +319,44 @@ class FiservAgent(AgentBase):
                 weights=[40, 30, 15, 10, 5],
             )[0]
 
-            if accion == "scroll_down":
-                delta = random.randint(80, 250)
-                scroll_y += delta
-                page.evaluate(f"window.scrollBy({{top: {delta}, behavior: 'smooth'}})")
-                time.sleep(random.uniform(0.3, 0.8))
+            try:
+                if accion == "scroll_down":
+                    delta = random.randint(80, 250)
+                    scroll_y += delta
+                    page.evaluate(f"window.scrollBy({{top: {delta}, behavior: 'smooth'}})")
+                    time.sleep(random.uniform(0.3, 0.8))
 
-            elif accion == "scroll_up" and scroll_y > 0:
-                delta = random.randint(50, 150)
-                scroll_y = max(0, scroll_y - delta)
-                page.evaluate(f"window.scrollBy({{top: -{delta}, behavior: 'smooth'}})")
-                time.sleep(random.uniform(0.2, 0.5))
+                elif accion == "scroll_up" and scroll_y > 0:
+                    delta = random.randint(50, 150)
+                    scroll_y = max(0, scroll_y - delta)
+                    page.evaluate(f"window.scrollBy({{top: -{delta}, behavior: 'smooth'}})")
+                    time.sleep(random.uniform(0.2, 0.5))
 
-            elif accion == "mouse_move":
-                target_x = random.randint(100, viewport["width"] - 100)
-                target_y = random.randint(100, viewport["height"] - 100)
-                pasos    = random.randint(5, 12)
-                for i in range(pasos):
-                    ix = mouse_x + (target_x - mouse_x) * (i + 1) / pasos
-                    iy = mouse_y + (target_y - mouse_y) * (i + 1) / pasos
-                    ix += random.uniform(-3, 3)
-                    iy += random.uniform(-3, 3)
-                    page.mouse.move(ix, iy)
-                    time.sleep(random.uniform(0.02, 0.06))
-                mouse_x, mouse_y = target_x, target_y
+                elif accion == "mouse_move":
+                    target_x = random.randint(100, viewport["width"] - 100)
+                    target_y = random.randint(100, viewport["height"] - 100)
+                    pasos    = random.randint(5, 12)
+                    for i in range(pasos):
+                        ix = mouse_x + (target_x - mouse_x) * (i + 1) / pasos
+                        iy = mouse_y + (target_y - mouse_y) * (i + 1) / pasos
+                        ix += random.uniform(-3, 3)
+                        iy += random.uniform(-3, 3)
+                        page.mouse.move(ix, iy)
+                        time.sleep(random.uniform(0.02, 0.06))
+                    mouse_x, mouse_y = target_x, target_y
 
-            elif accion == "pause":
-                time.sleep(random.uniform(0.5, 1.5))
+                elif accion == "pause":
+                    time.sleep(random.uniform(0.5, 1.5))
 
-            elif accion == "hover":
-                try:
-                    page.hover("body", position={"x": mouse_x, "y": mouse_y})
-                except Exception:
-                    pass
-                time.sleep(random.uniform(0.1, 0.3))
+                elif accion == "hover":
+                    try:
+                        page.hover("body", position={"x": mouse_x, "y": mouse_y})
+                    except Exception:
+                        pass
+                    time.sleep(random.uniform(0.1, 0.3))
+            except Exception as e:
+                logger.debug(f"[{self.name}] _simular_lectura interrupted: {e}")
+                break
 
     def _simular_comportamiento_minimo(self):
         page     = self._api_page
