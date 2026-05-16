@@ -133,6 +133,11 @@ def main():
         "--hidden-import", "cryptography.fernet",
         "--hidden-import", "cryptography.hazmat.primitives.kdf.pbkdf2",
 
+        # pycparser — dependencia de cffi/cryptography; PLY genera estos módulos
+        # en runtime pero en un exe frozen no puede escribir archivos, así que van empaquetados
+        "--hidden-import", "pycparser.lextab",
+        "--hidden-import", "pycparser.yacctab",
+
         # Browser automation
         "--hidden-import", "playwright",
         "--hidden-import", "playwright_stealth",

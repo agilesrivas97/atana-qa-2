@@ -173,7 +173,7 @@ def check_for_update():
 
     cfg = _github_config()
     if not cfg:
-        logger.warning("[autoupdater] GitHub config not set (github_token/owner/repo) — skipping update check")
+        logger.debug("[autoupdater] GitHub config not set (github_token/owner/repo) — skipping update check")
         return
 
     try:
