@@ -22,6 +22,10 @@ from shared.paths import CONFIG_FILE
 
 _config: dict = {}
 
+# Instancia global del agente Fiserv — el browser se mantiene vivo entre jobs.
+# Radware ve continuidad de sesión real → no bloquea en ejecuciones sucesivas.
+_fiserv_agente = None
+
 # Timestamp of the last successful update check — used to throttle GitHub calls.
 _last_update_check: datetime | None = None
 
@@ -87,6 +91,38 @@ def get_agent(name: str, config: dict):
     return cls(config)
 
 
+def _get_fiserv_agente():
+    """
+    Retorna la instancia global del agente Fiserv, creándola si no existe.
+    El browser se inicializa una sola vez y permanece vivo durante toda la
+    vida del dispatcher — Radware ve continuidad de sesión real entre jobs.
+    """
+    global _fiserv_agente
+    if _fiserv_agente is None:
+        from agents.fiserv import FiservAgent
+        _fiserv_agente = FiservAgent(_config)
+        _fiserv_agente._ensure_pw_ctx()
+        logger.info("[fiserv] Browser inicializado — quedará vivo entre jobs")
+    return _fiserv_agente
+
+
+def fiserv_keepalive():
+    """
+    Ejecuta un evaluate() liviano cada N minutos para mantener activas las
+    cookies de Dynatrace (rxvt, dtPC) entre ejecuciones de jobs.
+    No hace requests HTTP al servidor de Fiserv — solo mueve el puntero JS
+    para que el browser no quede completamente idle.
+    """
+    if not _config.get("agents", {}).get("fiserv", {}).get("enabled"):
+        return
+    try:
+        agente = _get_fiserv_agente()
+        agente._api_page.evaluate("window.scrollY")
+        logger.debug("[fiserv] keepalive OK")
+    except Exception as e:
+        logger.debug(f"[fiserv] keepalive error (no crítico): {e}")
+
+
 # ── Job processing ────────────────────────────────────────────────────────────
 
 def run_provider(provider: str, job_id: int, authorized: bool = False, requested_at=None):
@@ -102,7 +138,8 @@ def run_provider(provider: str, job_id: int, authorized: bool = False, requested
         return
 
     try:
-        agent = get_agent(provider, _config)
+        # Fiserv reutiliza la instancia global — el browser nunca se cierra entre jobs
+        agent = _get_fiserv_agente() if provider == "fiserv" else get_agent(provider, _config)
 
         # Skip intervention check for authorized jobs — human already clicked Play
         if not authorized and agent.requires_intervention():
@@ -365,7 +402,7 @@ $exe = '{exe_path}'
 $explorer = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
 if (-not $explorer) {{ Write-Host 'No interactive user logged in'; exit 0 }}
 $owner = $explorer.GetOwner()
-$user  = "$($owner.Domain)\$($owner.User)"
+$user  = "$($owner.Domain)\\$($owner.User)"
 $action    = New-ScheduledTaskAction -Execute $exe -Argument '--tray'
 $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
@@ -763,6 +800,18 @@ def main():
         next_run_time=datetime.now() + timedelta(seconds=15) if not args.run else None,
     )
 
+    # Keepalive: mantiene las cookies de Dynatrace activas entre jobs de Fiserv.
+    # Solo evalúa window.scrollY en el browser — sin requests al servidor.
+    fiserv_keepalive_min = int(
+        _config.get("agents", {}).get("fiserv", {}).get("fiserv_keepalive_interval_min", 20)
+    )
+    scheduler.add_job(
+        fiserv_keepalive,
+        "interval",
+        minutes=fiserv_keepalive_min,
+        id="fiserv_keepalive",
+    )
+
     # Initial sync of per-provider cron jobs — dynamic refresh happens in process_jobs().
     if not args.run:
         _sync_scheduler_jobs()
@@ -782,7 +831,9 @@ def main():
         while True:
             time.sleep(30)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Dispatcher stopped")
+        logger.info("Dispatcher detenido")
+        if _fiserv_agente:
+            _fiserv_agente.shutdown()
         scheduler.shutdown()
 
 

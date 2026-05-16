@@ -42,6 +42,24 @@ def main():
 
     print(f"Building ATANA Agents v{version}...")
 
+    # Verificar binarios de ffmpeg antes de buildear
+    ffmpeg_dir  = ROOT / "tools" / "ffmpeg"
+    ffmpeg_exe  = ffmpeg_dir / "ffmpeg.exe"
+    ffprobe_exe = ffmpeg_dir / "ffprobe.exe"
+    if not ffmpeg_exe.exists():
+        print(
+            f"\nERROR: ffmpeg.exe no encontrado en {ffmpeg_dir}\n"
+            f"  Descargar desde https://ffmpeg.org/download.html\n"
+            f"  (build estático Windows 64-bit — enlace directo: https://www.gyan.dev/ffmpeg/builds/)\n"
+            f"  Copiar ffmpeg.exe y ffprobe.exe a tools/ffmpeg/\n"
+        )
+        sys.exit(1)
+    if not ffprobe_exe.exists():
+        print(f"\nERROR: ffprobe.exe no encontrado en {ffmpeg_dir}\n")
+        sys.exit(1)
+    print(f"  ffmpeg.exe: {ffmpeg_exe} ({ffmpeg_exe.stat().st_size:,} bytes)")
+    print(f"  ffprobe.exe: {ffprobe_exe} ({ffprobe_exe.stat().st_size:,} bytes)")
+
     # Clean only the exe output — preserve dist/release/ (signed agents)
     if EXE_DIR.exists():
         shutil.rmtree(EXE_DIR)
@@ -128,10 +146,31 @@ def main():
         "--hidden-import", "PIL.ImageDraw",
         "--collect-submodules", "PIL",
 
+        # pyzbar necesita libzbar-64.dll (incluida en el paquete); --collect-all la copia
+        "--collect-all", "pyzbar",
+
+        # curl_cffi tiene libcurl y binarios SSL nativos; --collect-all los empaqueta
+        "--collect-all", "curl_cffi",
+
+        # textual carga CSS desde su paquete en runtime; --collect-data lo incluye
+        "--collect-data", "textual",
+
         # OTP (Fiserv TOTP authentication)
         "--hidden-import", "pyotp",
         "--hidden-import", "pyzbar",
         "--hidden-import", "pyzbar.pyzbar",
+
+        # Audio transcription — reCAPTCHA resolver gratuito (Fiserv)
+        "--hidden-import", "speech_recognition",
+        "--hidden-import", "pydub",
+        "--hidden-import", "pydub.utils",
+        "--hidden-import", "pydub.audio_segment",
+        "--hidden-import", "whisper",
+
+        # ffmpeg empaquetado — pydub/whisper lo usan para conversión de audio
+        # Los binarios van en tools/ffmpeg/ y se extraen a sys._MEIPASS/ffmpeg/
+        "--add-binary", f"{ffmpeg_exe}{os.pathsep}ffmpeg",
+        "--add-binary", f"{ffprobe_exe}{os.pathsep}ffmpeg",
 
         # tkinter is bundled with Python — no hidden import needed
 

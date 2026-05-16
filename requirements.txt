@@ -36,6 +36,14 @@ pyotp>=2.9.0      # TOTP automático (Fiserv)
 pyzbar>=0.1.9     # lectura de QR codes
 # imaplib viene con Python stdlib
 
+# Resolución de reCAPTCHA por audio (Fiserv — sin pagar)
+SpeechRecognition>=3.10.0   # Google Speech API gratuita (fallback offline)
+pydub>=0.25.1               # conversión mp3→wav para SpeechRecognition
+# openai-whisper>=20231117  # recomendado: offline, sin límites de API
+#                           # pip install openai-whisper
+#                           # Requiere ffmpeg en PATH (dev) o empaquetado en .exe
+# ffmpeg NO va en requirements.txt — va en tools/ffmpeg/ y se empaqueta con PyInstaller
+
 # Empaquetado (solo para build)
 pyinstaller>=6.0.0
 

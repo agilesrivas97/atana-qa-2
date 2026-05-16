@@ -55,12 +55,14 @@ Una vez terminada la instalación gráfica, las tablas existirán, las claves es
 
 **El técnico de ATANA debe inyectar credenciales al sistema de las siguientes formas:**
 
-**A través de Consola Rápida (`tools/setup_db_cli.py`)** -> *(Recomendado)*
-Abre Powershell/CMD sobre `C:\Program Files\ATANA\` y abre el gestor de lineas de comandos de ATANA para ingresar proveedores de a uno:
-```bash
-python tools/setup_db_cli.py
+**A través de la herramienta de configuración (`atana_setup.exe`)** -> *(Recomendado)*
+Abre Powershell/CMD como Administrador y ejecuta:
+```powershell
+& "C:\Program Files\ATANA\atana_setup.exe"
 ```
-> El script te consultará de manera interactiva credenciales a inyectar en la base de datos (Ej: secretos TOTP, tokens), leyendo a la vez las claves de Fernet autogeneradas por el Installer.
+> La herramienta te consultará de manera interactiva las credenciales a inyectar en la base de datos (Ej: secretos TOTP, tokens), leyendo las claves Fernet autogeneradas por el instalador.
+
+> **Nota para desarrollo:** Si trabajas directamente con el repositorio y tienes Python 3.12 instalado, también puedes usar `python tools/setup_db_cli.py`.
 
 ---
 
@@ -76,7 +78,7 @@ Get-Service AtanaDispatcher
 Invoke-WebRequest http://localhost:8765/health
 
 ### Revisar Logs de control central
-Get-Content "C:\ATANA\logs\dispatcher_$(Get-Date -Format 'yyyy-MM-dd').log" -Tail 20
+Get-Content "C:\Program Files\ATANA\logs\dispatcher_$(Get-Date -Format 'yyyy-MM-dd').log" -Tail 20
 ```
 
 Si todo funcionó, verás en la bandeja de sistema un ícono color GRIS (inicializando) o VERDE (activo, listo y esperando a la hora fijada).
