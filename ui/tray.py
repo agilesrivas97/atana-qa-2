@@ -57,21 +57,22 @@ class SystemTray:
         logger.info("Starting system tray...")
         self._stop_requested = False
 
-        self._icon = pystray.Icon(
-            "atana",
-            _make_icon("gray"),
-            "ATANA Agents",
-            menu=self._build_menu(),
-        )
+        if not any(t.name == "TrayUpdateLoop" for t in threading.enumerate()):
+            threading.Thread(target=self._update_loop, daemon=True, name="TrayUpdateLoop").start()
 
-        threading.Thread(target=self._update_loop, daemon=True).start()
-        try:
-            self._icon.run()
-        except Exception as e:
-            if not self._stop_requested:
-                logger.error(f"[tray] pystray error: {e} — reiniciando en 5s")
-                _time.sleep(5)
-                self.start()
+        while not self._stop_requested:
+            try:
+                self._icon = pystray.Icon(
+                    "atana",
+                    _make_icon("gray"),
+                    "ATANA Agents",
+                    menu=self._build_menu(),
+                )
+                self._icon.run()
+            except Exception as e:
+                if not self._stop_requested:
+                    logger.error(f"[tray] pystray error: {e} — reiniciando en 5s")
+                    _time.sleep(5)
 
     # ── Background update loop ─────────────────────────────────────────────────
 

@@ -430,7 +430,8 @@ class FiservAgent(AgentBase):
         text   = result["text"]
         logger.debug(f"[{self.name}] POST {url} → status={status} body={text[:300]}")
         if status not in (200, 201):
-            raise RuntimeError(f"[fiserv][pw] HTTP {status}: {text[:200]}")
+            error_preview = text[:200].replace('\n', ' ').replace('\r', '')
+            raise RuntimeError(f"[fiserv][pw] HTTP {status}: {error_preview}")
         if "Radware Bot Manager" in text or ("captcha" in text.lower() and "<html" in text.lower()):
             raise RuntimeError("[fiserv][pw] Radware bloqueó la solicitud")
         try:
@@ -467,7 +468,8 @@ class FiservAgent(AgentBase):
         if result.get("error") is not None:
             if status == 401:
                 raise RuntimeError("[fiserv][pw] JWT expirado (401)")
-            raise RuntimeError(f"[fiserv][pw] Download HTTP {status}: {result['error'][:200]}")
+            error_preview = result['error'][:200].replace('\n', ' ').replace('\r', '')
+            raise RuntimeError(f"[fiserv][pw] Download HTTP {status}: {error_preview}")
         content = _b64.b64decode(result["data"])
         logger.debug(f"[{self.name}] POST {url} → status={status} size={len(content):,} bytes")
         return content
