@@ -11,13 +11,14 @@ import hashlib
 import re
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 
 from dispatcher import db, notifier
+from shared.paths import BASE_DIR
 
 
 class AgentBase(ABC):
@@ -35,7 +36,6 @@ class AgentBase(ABC):
 
     @staticmethod
     def _validated_destination(raw: str) -> Path:
-        from shared.paths import BASE_DIR
         if any(part == ".." for part in Path(raw).parts):
             raise RuntimeError(f"destination_folder contains path traversal: {raw}")
         dest = Path(raw)
@@ -105,16 +105,15 @@ class AgentBase(ABC):
         """
         self.reference_date = (requested_at or datetime.now()).date()
 
-        from datetime import datetime as dt, time as dtime, timedelta
         yesterday = self.reference_date - timedelta(days=1)
-        self.period_to = dt.combine(yesterday, dtime(23, 59, 59))
+        self.period_to = datetime.combine(yesterday, dtime(23, 59, 59))
 
         last_end = db.get_provider_last_period_end(self.name)
         if last_end:
             # Start from the beginning of the day after the last covered period
-            self.period_from = dt.combine(last_end.date() + timedelta(days=1), dtime(0, 0, 0))
+            self.period_from = datetime.combine(last_end.date() + timedelta(days=1), dtime(0, 0, 0))
         else:
-            self.period_from = dt.combine(yesterday, dtime(0, 0, 0))
+            self.period_from = datetime.combine(yesterday, dtime(0, 0, 0))
 
         result = {
             "ok":         False,
@@ -254,7 +253,6 @@ class AgentBase(ABC):
 
     def _extract_date(self, name: str) -> Optional["datetime"]:
         """Attempts to extract a date from the filename."""
-        from datetime import date
         m = re.search(r'(\d{4})(\d{2})(\d{2})', name)
         if m:
             try:
