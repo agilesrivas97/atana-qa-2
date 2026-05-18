@@ -1,12 +1,14 @@
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -17,13 +19,30 @@ from dispatcher import db, notifier, api, autoupdater
 from dispatcher.agent_loader import load_agent, known_providers
 from dispatcher.version import APP_VERSION
 from shared import session_store
+from agents.fiserv import FiservAgent
+from shared.paths import BASE_DIR, CONFIG_FILE
 
-from shared.paths import CONFIG_FILE
+try:
+    import winreg as _winreg
+except ImportError:
+    _winreg = None
+
+try:
+    from playwright._impl._driver import compute_driver_executable as _compute_driver_executable
+    from playwright._impl._driver import get_driver_env as _get_driver_env
+except ImportError:
+    _compute_driver_executable = None
+    _get_driver_env = None
 
 _config: dict = {}
 
-# Instancia global del agente Fiserv — el browser se mantiene vivo entre jobs.
-# Radware ve continuidad de sesión real → no bloquea en ejecuciones sucesivas.
+# ── Fiserv Playwright thread ──────────────────────────────────────────────────
+# Playwright sync API usa greenlets con thread affinity: crear y usar el browser
+# context desde distintos hilos de APScheduler causa "Cannot switch to a different
+# thread". Solución: un único hilo persistente para TODAS las operaciones Playwright.
+_fiserv_pw_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="fiserv-pw"
+)
 _fiserv_agente = None
 
 # Timestamp of the last successful update check — used to throttle GitHub calls.
@@ -46,14 +65,13 @@ def load_config() -> dict:
         logger.error(f"config.json not found at {CONFIG_FILE}")
         sys.exit(1)
 
-    import re as _re
     text = CONFIG_FILE.read_text(encoding="utf-8")
     try:
         raw = json.loads(text)
     except json.JSONDecodeError:
         # Safety net: fix unescaped backslashes (e.g. server\SQLEXPRESS typed manually)
         # Handles \X and \u not followed by 4 hex digits without touching valid escapes
-        text = _re.sub(
+        text = re.sub(
             r'\\([^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))',
             lambda m: '\\\\' + m.group(1),
             text,
@@ -99,7 +117,6 @@ def _get_fiserv_agente():
     """
     global _fiserv_agente
     if _fiserv_agente is None:
-        from agents.fiserv import FiservAgent
         _fiserv_agente = FiservAgent(_config)
         _fiserv_agente._ensure_pw_ctx()
         logger.info("[fiserv] Browser inicializado — quedará vivo entre jobs")
@@ -108,22 +125,60 @@ def _get_fiserv_agente():
 
 def fiserv_keepalive():
     """
-    Ejecuta un evaluate() liviano cada N minutos para mantener activas las
-    cookies de Dynatrace (rxvt, dtPC) entre ejecuciones de jobs.
-    No hace requests HTTP al servidor de Fiserv — solo mueve el puntero JS
-    para que el browser no quede completamente idle.
+    Evalúa window.scrollY cada N minutos para mantener activas las cookies de
+    Dynatrace (rxvt, dtPC). No hace requests HTTP al servidor Fiserv.
+    Fire-and-forget: se despacha al hilo Playwright sin bloquear APScheduler.
     """
     if not _config.get("agents", {}).get("fiserv", {}).get("enabled"):
         return
-    try:
-        agente = _get_fiserv_agente()
-        agente._api_page.evaluate("window.scrollY")
-        logger.debug("[fiserv] keepalive OK")
-    except Exception as e:
-        logger.debug(f"[fiserv] keepalive error (no crítico): {e}")
+
+    def _do():
+        try:
+            agente = _get_fiserv_agente()
+            if agente._api_page:
+                agente._api_page.evaluate("window.scrollY")
+            logger.debug("[fiserv] keepalive OK")
+        except Exception as e:
+            logger.debug(f"[fiserv] keepalive error (no crítico): {e}")
+
+    _fiserv_pw_executor.submit(_do)
 
 
 # ── Job processing ────────────────────────────────────────────────────────────
+
+def _run_fiserv_job(job_id: int, authorized: bool, requested_at):
+    """Corre un job de Fiserv ÍNTEGRAMENTE dentro de _fiserv_pw_executor.
+
+    Playwright sync API tiene greenlet thread affinity: toda operación de browser
+    debe ocurrir en el mismo hilo donde se creó el contexto. Esta función solo se
+    llama desde _fiserv_pw_executor.submit() para garantizarlo.
+    """
+    ag_config = _config.get("agents", {}).get("fiserv", {})
+    if not ag_config.get("enabled", False):
+        logger.debug("[fiserv] Disabled — skipping")
+        db.update_job_error(job_id, "Agent disabled")
+        return
+    try:
+        agent = _get_fiserv_agente()
+        if not authorized and agent.requires_intervention():
+            db.update_job_intervention(job_id, agent.intervention_reason())
+            notifier.notify("fiserv", "requires_intervention", agent.intervention_reason())
+            logger.warning("[fiserv] Requires intervention")
+            return
+        if authorized:
+            logger.info("[fiserv] Authorized by user — running directly")
+        result = agent.run(job_id, requested_at=requested_at)
+        if result["ok"]:
+            logger.success(f"[fiserv] OK — {len(result['downloaded'])} downloaded")
+        else:
+            logger.error(f"[fiserv] Failed — {result['errors']}")
+    except NotImplementedError:
+        logger.warning("[fiserv] Not yet implemented")
+        db.update_job_error(job_id, "Agent not implemented")
+    except Exception as e:
+        logger.exception(f"[fiserv] Unexpected error: {e}")
+        db.update_job_error(job_id, str(e))
+
 
 def run_provider(provider: str, job_id: int, authorized: bool = False, requested_at=None):
     """Runs a specific agent for a given job.
@@ -131,6 +186,17 @@ def run_provider(provider: str, job_id: int, authorized: bool = False, requested
     authorized=True means the user clicked Play — skip requires_intervention()
     and call run() directly so the agent can open the browser / capture session.
     """
+    if provider == "fiserv":
+        # Despacha al hilo Playwright dedicado y espera — evita el error de greenlet
+        # "Cannot switch to a different thread" causado por APScheduler usando distintos
+        # hilos del pool en cada ejecución.
+        future = _fiserv_pw_executor.submit(_run_fiserv_job, job_id, authorized, requested_at)
+        try:
+            future.result(timeout=600)
+        except Exception as e:
+            logger.exception(f"[fiserv] Unexpected error in Playwright thread: {e}")
+        return
+
     ag_config = _config.get("agents", {}).get(provider, {})
     if not ag_config.get("enabled", False):
         logger.debug(f"[{provider}] Disabled — skipping")
@@ -138,8 +204,7 @@ def run_provider(provider: str, job_id: int, authorized: bool = False, requested
         return
 
     try:
-        # Fiserv reutiliza la instancia global — el browser nunca se cierra entre jobs
-        agent = _get_fiserv_agente() if provider == "fiserv" else get_agent(provider, _config)
+        agent = get_agent(provider, _config)
 
         # Skip intervention check for authorized jobs — human already clicked Play
         if not authorized and agent.requires_intervention():
@@ -254,8 +319,6 @@ def _debug_scheduler_jobs():
     """Logs current scheduler jobs and next execution time (safe)."""
     try:
         if scheduler:
-            from datetime import datetime
-
             for job in scheduler.get_jobs():
                 try:
                     next_run = None
@@ -287,8 +350,6 @@ def _sync_scheduler_jobs():
     """
     if scheduler is None:
         return
-
-    from datetime import datetime
 
     now = datetime.now().astimezone()
 
@@ -349,19 +410,18 @@ def _sync_scheduler_jobs():
 
 def _ensure_tray_registry():
     """Keeps HKCU\\...\\Run entry pointing to the current exe path."""
-    if os.name != "nt":
+    if os.name != "nt" or _winreg is None:
         return
     if _running_as_service():
         return
     try:
-        import winreg
         exe = str(Path(sys.executable).resolve())
-        key = winreg.CreateKey(
-            winreg.HKEY_CURRENT_USER,
+        key = _winreg.CreateKey(
+            _winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Run"
         )
-        winreg.SetValueEx(key, "AtanaTray", 0, winreg.REG_SZ, f'"{exe}" --tray')
-        winreg.CloseKey(key)
+        _winreg.SetValueEx(key, "AtanaTray", 0, _winreg.REG_SZ, f'"{exe}" --tray')
+        _winreg.CloseKey(key)
         logger.debug("[tray] Registro HKCU\\Run actualizado")
     except Exception as e:
         logger.debug(f"[tray] No se pudo actualizar registro: {e}")
@@ -525,7 +585,6 @@ def _install_crash_hooks():
 
 
 def setup_logging(config: dict):
-    from shared.paths import BASE_DIR
     app          = config.get("app", {})
     raw_log_dir  = app.get("log_dir", "./logs").strip("'\"")
     log_dir      = Path(raw_log_dir) if Path(raw_log_dir).is_absolute() else BASE_DIR / raw_log_dir
@@ -593,10 +652,9 @@ def _install_chromium(silent: bool = False):
     else:
         logger.debug(f"Background Chromium update check at {browsers}")
     try:
-        from playwright._impl._driver import compute_driver_executable, get_driver_env
-        driver_executable, driver_cli = compute_driver_executable()
+        driver_executable, driver_cli = _compute_driver_executable()
 
-        env = get_driver_env()
+        env = _get_driver_env()
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
 
         subprocess.run(
@@ -733,7 +791,6 @@ def main():
     logger.info("=" * 50)
 
     # Startup diagnostics — helps identify service detection and path issues
-    from shared.paths import BASE_DIR
     logger.debug(f"ATANA_SERVICE  = {os.environ.get('ATANA_SERVICE', '(not set)')}")
     logger.debug(f"SESSIONNAME    = {os.environ.get('SESSIONNAME', '(not set)')}")
     logger.debug(f"Frozen exe     = {getattr(sys, 'frozen', False)}")
@@ -793,7 +850,6 @@ def main():
     # first actual agent job.
     autoupdater.check_for_update()
 
-    from datetime import timedelta
     scheduler.add_job(
         process_jobs, "interval",
         minutes=check_interval,
@@ -834,7 +890,11 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         logger.info("Dispatcher detenido")
         if _fiserv_agente:
-            _fiserv_agente.shutdown()
+            try:
+                _fiserv_pw_executor.submit(_fiserv_agente.shutdown).result(timeout=30)
+            except Exception:
+                pass
+        _fiserv_pw_executor.shutdown(wait=False)
         scheduler.shutdown()
 
 

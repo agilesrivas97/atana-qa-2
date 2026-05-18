@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import json
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
@@ -8,6 +9,8 @@ from typing import Optional
 import pyodbc
 from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
+
+from dispatcher.database_factory import build_connection_args
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -89,7 +92,6 @@ def _wait_for_sql(retries: int = 10, delay: int = 10):
     Handles the case where Windows starts ATANA before SQL Server is ready.
     With retries=10 and delay=10s the service waits up to ~100s before giving up.
     """
-    import time
     for attempt in range(1, retries + 1):
         try:
             with connect() as conn:
@@ -115,7 +117,6 @@ def init(config: dict):
 
     driver = _resolve_driver(db.get("driver", "ODBC Driver 18 for SQL Server"))
 
-    from dispatcher.database_factory import build_connection_args
     _connection_args = build_connection_args(db, driver)
 
     _wait_for_sql()
@@ -465,12 +466,10 @@ def _decode_agent_row(row: dict) -> dict:
     cfg = dict(row)
 
     # Decrypt top-level password
-    provider = cfg.get("provider", "?")
     if cfg.get("password_enc"):
         raw = cfg["password_enc"] if isinstance(cfg["password_enc"], bytes) else bytes(cfg["password_enc"])
         decrypted_pwd = _decrypt(raw)
         cfg["password"] = decrypted_pwd
-        logger.debug(f"[db] [{provider}] password_enc: {len(raw)} bytes → decrypted ok={bool(decrypted_pwd)}")
     cfg.pop("password_enc", None)
 
     # Parse and merge extra_config JSON
@@ -489,7 +488,6 @@ def _decode_agent_row(row: dict) -> dict:
                 raw = v.encode() if isinstance(v, str) else v
                 decrypted = _decrypt(raw)
                 decrypted_extra[plain_key] = decrypted
-                logger.debug(f"[db] Decrypted extra_config field: {k!r} → {plain_key!r} (ok={bool(decrypted)})")
             elif k == "accounts" and isinstance(v, list):
                 # mercadopago accounts — decrypt each access_token_enc
                 accounts = []

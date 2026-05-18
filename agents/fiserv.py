@@ -32,6 +32,7 @@ __version__ = "5.0.0"
 
 import base64 as _b64
 import json as _json
+import os
 import random
 import re as _re
 import shutil
@@ -39,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import timedelta as _td
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -74,6 +76,11 @@ try:
     from playwright_stealth import stealth_sync as _stealth_sync
 except ImportError:
     _stealth_sync = None
+
+try:
+    from playwright._impl._driver import compute_driver_executable as _compute_driver_executable
+except ImportError:
+    _compute_driver_executable = None
 
 
 API_BASE_URL = "https://merchantcenter.fiservapp.com"
@@ -193,9 +200,14 @@ class FiservAgent(AgentBase):
             self._ensure_chromium()
 
         # launch_persistent_context: el contexto ES el browser (no hay _browser separado)
+        # headless: siempre True en producción (servicio Windows, Session 0).
+        # En dev respeta la config de la DB; si no está configurado, default True.
+        headless_cfg = self.config.get("headless", True)
+        headless = True if os.environ.get("ATANA_SERVICE") == "1" else bool(headless_cfg)
+
         self._pw_ctx = self._pw.chromium.launch_persistent_context(
             user_data_dir       = str(self._profile_path),
-            headless            = self.config.get("headless", True),
+            headless            = headless,
             user_agent          = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -236,9 +248,10 @@ class FiservAgent(AgentBase):
 
     def _ensure_chromium(self):
         logger.info(f"[{self.name}] Chromium not found — installing (first run, ~15s)...")
+        if _compute_driver_executable is None:
+            raise RuntimeError("[fiserv] playwright._impl._driver not available")
         try:
-            from playwright._impl._driver import compute_driver_executable
-            driver, env = compute_driver_executable()
+            driver, env = _compute_driver_executable()
             result = subprocess.run(
                 [driver, "install", "chromium"],
                 env=env, capture_output=True, text=True,
@@ -641,8 +654,6 @@ class FiservAgent(AgentBase):
           Inicio:         2-5s  (navegación al menú de reportes)
           Entre páginas:  1.5-4s
         """
-        from datetime import timedelta as _td
-
         jwt      = self._get_jwt_valido()
         url      = f"{self._base}/settlement/Settlement/SettlementFileList"
         end_date = self.period_to.date() + _td(days=1)
