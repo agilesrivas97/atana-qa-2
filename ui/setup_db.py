@@ -163,13 +163,13 @@ WHEN NOT MATCHED THEN
     """
 MERGE agent_config AS t
 USING (VALUES
-    ('prisma',      0, './settlements/prisma',      '{merchant}_{date}.{ext}', 8,  0),
-    ('cabal',       0, './settlements/cabal',       'CABAL_{date}.{ext}',      8,  5),
-    ('naranjax',    0, './settlements/naranjax',    'NX_{date}.{ext}',         8, 10),
-    ('fiserv',      0, './settlements/fiserv',      'FISERV_{date}.{ext}',     8, 15),
-    ('amex',        0, './settlements/amex',        'AMEX_{date}.{ext}',       8, 20),
-    ('getnet',      0, './settlements/getnet',      'GETNET_{date}.{ext}',     8, 25),
-    ('mercadopago', 0, './settlements/mercadopago', 'MP_{alias}_{date}.{ext}', 8, 30)
+    ('prisma',      0, './settlements/prisma',      '', 8,  0),
+    ('cabal',       0, './settlements/cabal',       '', 8,  5),
+    ('naranjax',    0, './settlements/naranjax',    '', 8, 10),
+    ('fiserv',      0, './settlements/fiserv',      '', 8, 15),
+    ('amex',        0, './settlements/amex',        '', 8, 20),
+    ('getnet',      0, './settlements/getnet',      '', 8, 25),
+    ('mercadopago', 0, './settlements/mercadopago', '', 8, 30)
 ) AS s(provider, enabled, destination_folder, rename_pattern, schedule_hour, schedule_minute)
 ON t.provider = s.provider
 WHEN NOT MATCHED THEN
