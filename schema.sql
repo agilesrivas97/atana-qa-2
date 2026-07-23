@@ -175,8 +175,8 @@ GO
 INSERT INTO agent_config
     (provider, enabled, destination_folder, rename_pattern, schedule_hour, schedule_minute)
 VALUES
-    ('fiserv',      0, 'C:\ATANA\settlements\fiserv',      'FISERV_{date}.{ext}',     8, 15),
-    ('mercadopago', 0, 'C:\ATANA\settlements\mercadopago', 'MP_{alias}_{date}.{ext}', 8, 30)
+    ('fiserv',      0, 'C:\ATANA\settlements\fiserv',      '', 8, 15),
+    ('mercadopago', 0, 'C:\ATANA\settlements\mercadopago', '', 8, 30)
 GO
 
 -- Valores iniciales de system_config
