@@ -190,9 +190,13 @@ def run_provider(provider: str, job_id: int, authorized: bool = False, requested
         # Despacha al hilo Playwright dedicado y espera — evita el error de greenlet
         # "Cannot switch to a different thread" causado por APScheduler usando distintos
         # hilos del pool en cada ejecución.
+        # Timeout generoso: list_files() ahora trocea rangos largos en varias ventanas
+        # (ver MAX_RANGE_DAYS en agents/fiserv.py), y un backfill grande (varios meses,
+        # muchos archivos) puede tardar bastante más que los 600s originales. Si se supera
+        # este timeout el hilo de background sigue corriendo igual — solo dejamos de esperarlo.
         future = _fiserv_pw_executor.submit(_run_fiserv_job, job_id, authorized, requested_at)
         try:
-            future.result(timeout=600)
+            future.result(timeout=1800)
         except Exception as e:
             logger.exception(f"[fiserv] Unexpected error in Playwright thread: {e}")
         return

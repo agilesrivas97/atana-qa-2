@@ -239,10 +239,28 @@ class AgentBase(ABC):
             data.update(extra_data)
 
         try:
-            return self.pattern.format(**data)
+            renamed = self.pattern.format(**data)
         except KeyError as e:
             logger.warning(f"[{self.name}] Renaming error: missing key {e} in pattern '{self.pattern}'")
             return original_name
+
+        return self._dedupe_name(renamed)
+
+    def _dedupe_name(self, filename: str) -> str:
+        """
+        Evita pisar archivos ya existentes en destino (ej: un patrón como
+        {date}.{ext} produce el mismo nombre para varios archivos del mismo día).
+        Agrega un sufijo _2, _3, ... hasta encontrar un nombre libre.
+        """
+        dest = self.destination / filename
+        if not dest.exists():
+            return filename
+
+        stem, ext = Path(filename).stem, Path(filename).suffix
+        counter = 2
+        while (self.destination / f"{stem}_{counter}{ext}").exists():
+            counter += 1
+        return f"{stem}_{counter}{ext}"
 
     def _sha256(self, path: Path) -> str:
         sha = hashlib.sha256()
