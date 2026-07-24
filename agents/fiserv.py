@@ -49,7 +49,7 @@ import httpx
 import pyotp
 from loguru import logger
 
-from agents.base import AgentBase
+from agents.base import AgentBase, InterventionRequired
 
 # Imports opcionales — verificados en runtime; None si no están instalados
 try:
@@ -85,6 +85,11 @@ except ImportError:
 
 API_BASE_URL = "https://merchantcenter.fiservapp.com"
 RECAPTCHA_SITE_KEY = "6LdQlQ0pAAAAADjbxloDIchjMWSdfO5H3l6Lnvzi"
+
+# Fiserv trunca silenciosamente (sin error) los resultados de SettlementFileList
+# cuando el rango From/To pedido es muy largo (~30 días observado). list_files()
+# trocea el rango en ventanas de este tamaño para evitar perder archivos sin darse cuenta.
+MAX_RANGE_DAYS = 25
 
 
 class FiservAgent(AgentBase):
@@ -558,6 +563,15 @@ class FiservAgent(AgentBase):
                         "typeAuthentication": "TOTP",
                     },
                 )
+                # requestOtp responde HTTP 200 incluso con credenciales incorrectas —
+                # el error viene en el body ("success": false, "message": "wrongUserOrPass"),
+                # no como HTTP 401. Cortar acá evita gastar las Zonas 2/3 (hasta ~44s) y
+                # reintentos inútiles contra credenciales que no van a cambiar solas.
+                if body1.get("success") is False and body1.get("message") == "wrongUserOrPass":
+                    raise InterventionRequired(
+                        "[fiserv] Credenciales inválidas — usuario o contraseña incorrectos (requestOtp)"
+                    )
+
                 totp_token = body1.get("data", body1).get("totpToken", "")
                 logger.debug(f"[{self.name}] totpToken recibido: {bool(totp_token)}")
 
@@ -637,7 +651,12 @@ class FiservAgent(AgentBase):
                             )
                     continue
                 if "401" in msg:
-                    raise RuntimeError("[fiserv] Credenciales inválidas")
+                    # Usuario/contraseña rechazados por Fiserv — reintentar no sirve de nada.
+                    # InterventionRequired detiene el job de inmediato (sin retries) y lo marca
+                    # requires_intervention para que un humano corrija las credenciales.
+                    raise InterventionRequired(
+                        "[fiserv] Credenciales inválidas — usuario o contraseña incorrectos"
+                    )
                 logger.warning(f"[{self.name}] Intento {intento}: {e}")
                 if intento < MAX_INTENTOS:
                     time.sleep(random.uniform(5, 15))
@@ -650,17 +669,16 @@ class FiservAgent(AgentBase):
         """
         POST /settlement/Settlement/SettlementFileList
 
+        Fiserv trunca silenciosamente los resultados cuando el rango From/To
+        pedido es muy largo (sin devolver error) — por eso el rango total
+        (self.period_from → self.period_to) se trocea en ventanas de
+        MAX_RANGE_DAYS antes de pedir cada una.
+
         Delays de Zona 3/4 incluidos:
           Inicio:         2-5s  (navegación al menú de reportes)
           Entre páginas:  1.5-4s
+          Entre ventanas: 1.5-4s
         """
-        jwt      = self._get_jwt_valido()
-        url      = f"{self._base}/settlement/Settlement/SettlementFileList"
-        end_date = self.period_to.date() + _td(days=1)
-        from_str = f"{self.period_from.date().isoformat()}T03:00:00.000Z"
-        to_str   = f"{end_date.isoformat()}T03:00:00.000Z"
-        auth     = {"Authorization": f"Bearer {jwt}"}
-
         logger.info(
             f"[{self.name}] Fetching file list "
             f"{self.period_from.date()} → {self.period_to.date()}..."
@@ -668,6 +686,53 @@ class FiservAgent(AgentBase):
 
         # Zona 3 / inicio de actividad de negocio
         time.sleep(random.uniform(2, 5))
+
+        seen  = set()
+        items = []
+
+        windows = self._date_windows(self.period_from, self.period_to)
+        for i, (window_from, window_to) in enumerate(windows):
+            window_items = self._fetch_window(window_from, window_to)
+            for item in window_items:
+                name = item["name"]
+                if name not in seen:
+                    seen.add(name)
+                    items.append(item)
+
+            logger.info(
+                f"[{self.name}] Ventana {window_from.date()} → {window_to.date()}: "
+                f"{len(window_items)} file(s)"
+            )
+
+            if i < len(windows) - 1:
+                # Zona 4 — entre ventanas de fecha
+                time.sleep(random.uniform(1.5, 4))
+
+        logger.info(f"[{self.name}] {len(items)} file(s) found (total)")
+        return items
+
+    @staticmethod
+    def _date_windows(period_from, period_to) -> list[tuple]:
+        """Divide [period_from, period_to] en ventanas de máximo MAX_RANGE_DAYS días."""
+        windows      = []
+        window_start = period_from
+        while window_start <= period_to:
+            window_end = min(
+                window_start + _td(days=MAX_RANGE_DAYS - 1),
+                period_to,
+            )
+            windows.append((window_start, window_end))
+            window_start = window_end + _td(days=1)
+        return windows
+
+    def _fetch_window(self, window_from, window_to) -> list[dict]:
+        """Pagina (Skip/Take) los resultados de SettlementFileList para una sola ventana de fecha."""
+        jwt        = self._get_jwt_valido()
+        url        = f"{self._base}/settlement/Settlement/SettlementFileList"
+        end_date   = window_to.date() + _td(days=1)
+        from_str   = f"{window_from.date().isoformat()}T03:00:00.000Z"
+        to_str     = f"{end_date.isoformat()}T03:00:00.000Z"
+        auth       = {"Authorization": f"Bearer {jwt}"}
 
         PAGE_SIZE = 40
         items     = []
@@ -715,7 +780,6 @@ class FiservAgent(AgentBase):
             # Zona 4 — entre páginas paginadas
             time.sleep(random.uniform(1.5, 4))
 
-        logger.info(f"[{self.name}] {len(items)} file(s) found")
         return items
 
     # ── Download ──────────────────────────────────────────────────────────────

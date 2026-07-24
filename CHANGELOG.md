@@ -5,6 +5,15 @@ All notable changes to the **ATANA Agents** project will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Fiserv — truncamiento silencioso en rangos largos:** `SettlementFileList` recorta
+  los resultados sin devolver error cuando el rango `From`/`To` pedido es muy largo
+  (~30 días observado), lo que causaba jobs marcados `ok` con menos archivos de los
+  realmente disponibles. `list_files()` ahora trocea el rango en ventanas de máximo
+  `MAX_RANGE_DAYS` (25) días y agrega los resultados de todas las ventanas.
+
 ## [Unreleased / v0.0.9] - 2026-05-16
 
 ### Added
