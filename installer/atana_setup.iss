@@ -61,6 +61,9 @@ Source: "nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Registers the Scheduled Task that supervises the tray icon (see [Run] below)
 Source: "register_tray_task.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
+; Reinicia el tray a mano (soporte) sin esperar al watchdog ni reinstalar
+Source: "restart_tray.ps1"; DestDir: "{app}"; Flags: ignoreversion
+
 ; Default config — copied only if config.json does not exist yet
 Source: "..\config.example.json"; DestDir: "{app}"; DestName: "config.json"; Flags: onlyifdoesntexist uninsneveruninstall
 
@@ -72,6 +75,11 @@ Name: "{app}\logs"; Permissions: users-modify
 ; Panel — abre independientemente del tray/servicio (ver ui/panel_main.py)
 Name: "{group}\ATANA Panel"; Filename: "{app}\atana_panel.exe"
 Name: "{autodesktop}\ATANA Panel"; Filename: "{app}\atana_panel.exe"; Tasks: desktopicon
+
+; Reiniciar tray — utilidad de soporte, ver installer/restart_tray.ps1
+Name: "{group}\ATANA - Reiniciar Tray"; Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\restart_tray.ps1"""; \
+    WorkingDir: "{app}"; IconFilename: "{app}\atana_dispatcher.exe"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crear acceso directo al Panel en el Escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked

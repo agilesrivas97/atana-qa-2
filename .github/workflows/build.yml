@@ -47,6 +47,9 @@ jobs:
       - name: Build exe
         run: python build/build.py --version ${{ github.ref_name }}
 
+      - name: Build panel
+        run: python tools/build_panel.py
+
       - name: Get NSSM
         shell: pwsh
         run: |
@@ -91,6 +94,7 @@ jobs:
           prerelease: false
           files: |
             dist/exe/atana_dispatcher.exe
+            dist/exe/atana_panel.exe
             dist/exe/build_info.json
             installer/Output/AtanaAgents_Setup_v*.exe
         env:
