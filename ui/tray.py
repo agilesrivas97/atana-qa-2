@@ -10,9 +10,11 @@ System tray icon.
 """
 
 import json
+import os
 import sys
 import threading
 from shared.paths import BASE_DIR as _BASE_DIR, CONFIG_FILE as _CONFIG_FILE
+from shared.api_client import ApiClient, ApiError
 from PIL import Image, ImageDraw
 import pystray
 from loguru import logger
@@ -46,6 +48,7 @@ class SystemTray:
         self._current_color = "gray"
         self._icon: pystray.Icon = None
         self._config: dict = {}
+        self._api_client = ApiClient()
         self._stop_requested = False
         # Track providers already alerted — only alert once per new intervention
         self._alerted: set[str] = set()
@@ -81,28 +84,28 @@ class SystemTray:
         while True:
             self._try_reload_config()
             self._update_icon()
+            self._send_heartbeat()
             time.sleep(30)
 
-    def _api(self, method: str, path: str, body: dict = None) -> dict:
-        import urllib.request, urllib.error
-        port = self._config.get("app", {}).get("api_port", 8765)
-        api_key = self._config.get("app", {}).get("api_key", "")
-        
-        req = urllib.request.Request(f"http://localhost:{port}{path}", method=method)
-        if api_key:
-            req.add_header("X-API-Key", api_key)
-        
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            req.add_header("Content-Type", "application/json")
-            req.add_header("Content-Length", str(len(data)))
-            req.data = data
-            
+    def _send_heartbeat(self):
+        """
+        Tells the dispatcher this tray is alive (system_config: tray_heartbeat/
+        tray_pid). If this goes stale, _tray_watchdog_check() in main.py kills
+        this PID so the Scheduled Task watchdog can bring up a fresh instance.
+        """
         try:
-            with urllib.request.urlopen(req, timeout=3) as response:
-                return json.loads(response.read())
+            self._api("POST", "/tray/heartbeat", {"pid": os.getpid()})
         except Exception as e:
-            raise RuntimeError(f"API {method} {path} error: {e}")
+            logger.debug(f"Tray heartbeat failed: {e}")
+
+    def _api(self, method: str, path: str, body: dict = None) -> dict:
+        # Kept as a thin wrapper (same call signature everywhere in this file)
+        # around the client shared with ui/panel_main.py — see shared/api_client.py.
+        self._api_client.set_config(self._config)
+        try:
+            return self._api_client.call(method, path, body, timeout=3)
+        except ApiError as e:
+            raise RuntimeError(f"API {method} {path} error: {e}") from e
 
     def _load_agents_from_api(self):
         """Loads enabled agents from API into self._config['agents']."""
@@ -244,6 +247,12 @@ class SystemTray:
                     ),
                 )
             )
+
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("📊 Abrir panel",    lambda *_: self._open_panel()))
+        items.append(pystray.MenuItem("⚙ Configuración",  lambda *_: self._open_panel(config=True)))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("✕ Salir", self._exit))
 
         return pystray.Menu(*items)
 
@@ -392,17 +401,32 @@ class SystemTray:
         except Exception as e:
             logger.warning(f"[{provider}] Could not create retry job: {e}")
 
-    def _open_tui(self, icon=None, item=None):
-        """Open the tkinter dashboard window."""
+    def _open_panel(self, config: bool = False):
+        """
+        Opens the panel (Overview + Configuración) as its own process, so it
+        works independently of the tray — it's a separate exe in the install
+        folder (atana_panel.exe), not a mode of the tray/dispatcher exe.
+        """
         import subprocess, sys
         flags = {}
         if sys.platform == "win32":
-            # No console flash on Windows
             flags["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+        args = ["--config"] if config else []
+
         if getattr(sys, "frozen", False):
-            subprocess.Popen([sys.executable, "--tui"], **flags)
+            panel_exe = _BASE_DIR / "atana_panel.exe"
+            if not panel_exe.exists():
+                logger.warning(f"Panel not found at {panel_exe}")
+                if self._icon:
+                    try:
+                        self._icon.notify("atana_panel.exe no encontrado en la carpeta de instalación.", "ATANA")
+                    except Exception:
+                        pass
+                return
+            subprocess.Popen([str(panel_exe), *args], **flags)
         else:
+            # Dev fallback until ui/panel_main.py ships (see Fase 3 del plan).
             subprocess.Popen(
                 [sys.executable, "-m", "ui.tui"],
                 cwd=_BASE_DIR,

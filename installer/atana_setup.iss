@@ -51,8 +51,15 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 ; Main executable (agents bundled inside) — built by build/build.py into dist/exe/
 Source: "..\dist\exe\atana_dispatcher.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+; Panel (Overview + Configuración) — separate exe, built by tools/build_panel.py
+; into the same dist/exe/. Openable independently of the tray/dispatcher service.
+Source: "..\dist\exe\atana_panel.exe"; DestDir: "{app}"; Flags: ignoreversion
+
 ; NSSM service wrapper — committed to installer/
 Source: "nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+; Registers the Scheduled Task that supervises the tray icon (see [Run] below)
+Source: "register_tray_task.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Default config — copied only if config.json does not exist yet
 Source: "..\config.example.json"; DestDir: "{app}"; DestName: "config.json"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -62,7 +69,12 @@ Source: "..\config.example.json"; DestDir: "{app}"; DestName: "config.json"; Fla
 Name: "{app}\logs"; Permissions: users-modify
 
 [Icons]
-; No Start Menu shortcut needed (runs as service + tray)
+; Panel — abre independientemente del tray/servicio (ver ui/panel_main.py)
+Name: "{group}\ATANA Panel"; Filename: "{app}\atana_panel.exe"
+Name: "{autodesktop}\ATANA Panel"; Filename: "{app}\atana_panel.exe"; Tasks: desktopicon
+
+[Tasks]
+Name: "desktopicon"; Description: "Crear acceso directo al Panel en el Escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked
 
 [Run]
 ; --- UPGRADE: detener servicio antes de reemplazar el exe ---
@@ -93,21 +105,27 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--setup-db"; Flags: waituntilter
 ; --- SIEMPRE: iniciar servicio (config.json ya tiene datos correctos) ---
 Filename: "{app}\nssm.exe"; Parameters: "start {#MyServiceName}"; Flags: runhidden waituntilterminated
 
-; --- SIEMPRE: lanzar tray (en fresh install config.json ya esta listo; en upgrade reemplaza el viejo) ---
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; Flags: nowait
+; --- UPGRADE: limpiar la entrada HKCU\Run de instaladores viejos (superada por la Scheduled Task de abajo) ---
+Filename: "reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v AtanaTray /f"; Flags: runhidden; Check: IsServiceInstalled
 
-[Registry]
-; Add tray icon to user startup (runs in interactive session, connects via API)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "AtanaTray"; ValueData: """{app}\{#MyAppExeName}"" --tray"; Flags: uninsdeletevalue
+; --- SIEMPRE: registrar (o reparar) la Scheduled Task que supervisa el tray — arranca "at logon" y
+;     se re-dispara cada 3 min si el tray murio (ver installer/register_tray_task.ps1) ---
+Filename: "powershell.exe"; Parameters: "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\register_tray_task.ps1"" -ExePath ""{app}\{#MyAppExeName}"""; Flags: runhidden waituntilterminated
+
+; --- SIEMPRE: lanzar tray ahora mismo (la Scheduled Task recien registrada no dispara "at logon"
+;     retroactivamente para la sesion ya activa; en upgrade reemplaza el viejo) ---
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; Flags: nowait
 
 [UninstallRun]
 ; 1. Detener el servicio
 Filename: "{app}\nssm.exe"; Parameters: "stop {#MyServiceName}"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 ; 2. Matar el proceso tray (corre en sesion de usuario, no lo maneja NSSM)
 Filename: "taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillTray"
-; 3. Breve pausa para que el SO libere los handles antes de eliminar el servicio
+; 3. Eliminar la Scheduled Task que supervisaba el tray
+Filename: "powershell.exe"; Parameters: "-NonInteractive -WindowStyle Hidden -Command ""Unregister-ScheduledTask -TaskName 'AtanaTrayWatchdog' -Confirm:$false -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTrayTask"
+; 4. Breve pausa para que el SO libere los handles antes de eliminar el servicio
 Filename: "powershell.exe"; Parameters: "-WindowStyle Hidden -NonInteractive -Command ""Start-Sleep -Seconds 3"""; Flags: runhidden waituntilterminated; RunOnceId: "WaitHandles"
-; 4. Eliminar el servicio de Windows
+; 5. Eliminar el servicio de Windows
 Filename: "{app}\nssm.exe"; Parameters: "remove {#MyServiceName} confirm"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 
 [UninstallDelete]

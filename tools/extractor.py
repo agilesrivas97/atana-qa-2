@@ -1,163 +1,20 @@
 # pip install zxing-cpp pillow pyotp
 import os
 import sys
-import zxingcpp
-from PIL import Image
-from urllib.parse import urlparse, parse_qs
-import pyotp
-import base64
-import struct
 import time
 from pathlib import Path
 
+# Standalone CLI over shared.totp_extractor — kept as a separate exe (atana_otp.exe,
+# see build_extractor.py) for manual/offline use. The panel's "Subir QR" button
+# (ui/config_panel.py) uses the same shared module directly, in-process.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from shared.totp_extractor import extract_secret_from_uri  # noqa: E402
 
-def parse_varint(data: bytes, idx: int) -> tuple[int, int]:
-    """Lee un varint de protobuf. Retorna (valor, nuevo_idx)."""
-    result = 0
-    shift  = 0
-    while idx < len(data):
-        byte    = data[idx]
-        idx    += 1
-        result |= (byte & 0x7F) << shift
-        shift  += 7
-        if not (byte & 0x80):
-            break
-    return result, idx
-
-
-def parse_length_delimited(data: bytes, idx: int) -> tuple[bytes, int]:
-    """Lee un campo length-delimited. Retorna (bytes, nuevo_idx)."""
-    length, idx = parse_varint(data, idx)
-    return data[idx:idx + length], idx + length
-
-
-def parse_migration_payload(payload: bytes) -> list[dict]:
-    """
-    Parsea el protobuf de Google Authenticator migration.
-    Estructura:
-      MigrationPayload {
-        repeated OtpParameters otp_parameters = 1;
-      }
-      OtpParameters {
-        bytes  secret    = 1;
-        string name      = 2;
-        string issuer    = 3;
-        int32  algorithm = 4;
-        int32  digits    = 5;
-        int32  type      = 6;
-        int64  counter   = 7;
-      }
-    """
-    accounts = []
-    idx = 0
-
-    while idx < len(payload):
-        tag_wire, idx = parse_varint(payload, idx)
-        field_number  = tag_wire >> 3
-        wire_type     = tag_wire & 0x7
-
-        if wire_type == 2:  # length-delimited
-            field_data, idx = parse_length_delimited(payload, idx)
-
-            if field_number == 1:  # otp_parameters
-                account = _parse_otp_parameters(field_data)
-                accounts.append(account)
-            # ignorar otros campos del MigrationPayload
-
-        elif wire_type == 0:  # varint
-            _, idx = parse_varint(payload, idx)
-        elif wire_type == 5:  # 32-bit
-            idx += 4
-        elif wire_type == 1:  # 64-bit
-            idx += 8
-        else:
-            break  # tipo desconocido — parar
-
-    return accounts
-
-
-def _parse_otp_parameters(data: bytes) -> dict:
-    """Parsea un OtpParameters del protobuf."""
-    account = {
-        "secret":    None,
-        "name":      "",
-        "issuer":    "",
-        "algorithm": 1,   # SHA1
-        "digits":    6,
-        "type":      2,   # TOTP
-    }
-    idx = 0
-
-    while idx < len(data):
-        tag_wire, idx = parse_varint(data, idx)
-        field_number  = tag_wire >> 3
-        wire_type     = tag_wire & 0x7
-
-        if wire_type == 2:
-            field_data, idx = parse_length_delimited(data, idx)
-            if field_number == 1:
-                account["secret"] = base64.b32encode(field_data).decode().rstrip("=")
-            elif field_number == 2:
-                account["name"]   = field_data.decode("utf-8", errors="ignore")
-            elif field_number == 3:
-                account["issuer"] = field_data.decode("utf-8", errors="ignore")
-
-        elif wire_type == 0:
-            value, idx = parse_varint(data, idx)
-            if field_number == 4:
-                account["algorithm"] = value
-            elif field_number == 5:
-                account["digits"]    = value
-            elif field_number == 6:
-                account["type"]      = value
-
-        elif wire_type == 5:
-            idx += 4
-        elif wire_type == 1:
-            idx += 8
-        else:
-            break
-
-    return account
-
-
-def extract_secret_from_uri(uri: str) -> list[dict]:
-    """
-    Extrae secretos de cualquier URI de autenticador:
-      - otpauth://totp/...?secret=...
-      - otpauth-migration://offline?data=...
-    Retorna lista de dicts con secret, name, issuer.
-    """
-    if uri.startswith("otpauth-migration://"):
-        query   = parse_qs(urlparse(uri).query)
-        data_b4 = query.get("data", [None])[0]
-        if not data_b4:
-            return []
-        # Agregar padding si falta
-        padding = (4 - len(data_b4) % 4) % 4
-        payload = base64.b64decode(data_b4 + "=" * padding)
-        return parse_migration_payload(payload)
-
-    elif uri.startswith("otpauth://"):
-        parsed = urlparse(uri)
-        params = parse_qs(parsed.query)
-        secret = params.get("secret", [None])[0]
-        if not secret:
-            return []
-        # Normalizar secreto — sin espacios, uppercase, con padding
-        secret  = secret.strip().replace(" ", "").upper()
-        padding = (8 - len(secret) % 8) % 8
-        secret  = secret + "=" * padding
-        name    = parsed.path.lstrip("/")
-        issuer  = params.get("issuer", [""])[0]
-        return [{"secret": secret, "name": name, "issuer": issuer}]
-
-    return []
+import pyotp
 
 
 def verify_totp(secret: str) -> None:
     """Muestra el código actual y los adyacentes para verificar."""
-    # Asegurar padding correcto
     padding = (8 - len(secret) % 8) % 8
     secret  = secret + "=" * padding
 
@@ -183,6 +40,8 @@ def _process(img_path: Path) -> bool:
         return False
 
     try:
+        from PIL import Image
+        import zxingcpp
         img     = Image.open(img_path).convert("RGB")
         results = zxingcpp.read_barcodes(img)
     except Exception as e:

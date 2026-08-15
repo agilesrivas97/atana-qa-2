@@ -34,6 +34,7 @@ loguru>=0.7.0
 # OTP
 pyotp>=2.9.0      # TOTP automático (Fiserv)
 pyzbar>=0.1.9     # lectura de QR codes
+zxing-cpp>=2.2.0  # lectura de QR — tools/extractor.py y el botón "Subir QR" del panel
 # imaplib viene con Python stdlib
 
 # Resolución de reCAPTCHA por audio (Fiserv — sin pagar)

@@ -23,11 +23,6 @@ from agents.fiserv import FiservAgent
 from shared.paths import BASE_DIR, CONFIG_FILE
 
 try:
-    import winreg as _winreg
-except ImportError:
-    _winreg = None
-
-try:
     from playwright._impl._driver import compute_driver_executable as _compute_driver_executable
     from playwright._impl._driver import get_driver_env as _get_driver_env
 except ImportError:
@@ -412,82 +407,106 @@ def _sync_scheduler_jobs():
 
     _debug_scheduler_jobs()
 
-def _ensure_tray_registry():
-    """Keeps HKCU\\...\\Run entry pointing to the current exe path."""
-    if os.name != "nt" or _winreg is None:
-        return
-    if _running_as_service():
-        return
-    try:
-        exe = str(Path(sys.executable).resolve())
-        key = _winreg.CreateKey(
-            _winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run"
-        )
-        _winreg.SetValueEx(key, "AtanaTray", 0, _winreg.REG_SZ, f'"{exe}" --tray')
-        _winreg.CloseKey(key)
-        logger.debug("[tray] Registro HKCU\\Run actualizado")
-    except Exception as e:
-        logger.debug(f"[tray] No se pudo actualizar registro: {e}")
+_TRAY_TASK_NAME       = "AtanaTrayWatchdog"
+_TRAY_HEARTBEAT_STALE_MIN = 4  # tray posts a heartbeat every 30s — 4 min is well past any hiccup
 
 
-def _ensure_tray_running():
+def _ensure_tray_supervised():
     """
-    Checks if the tray process is already running; if not, launches it.
-    In service mode (Session 0) uses Task Scheduler to cross the session boundary.
-    In interactive mode uses a direct subprocess call.
-    Called at every dispatcher startup — covers first boot, post-update and tray crash.
+    Registers (idempotently) the Scheduled Task that supervises the tray icon
+    and makes sure one instance is running right now.
+    Called once at every dispatcher startup — covers first boot, post-update
+    (including auto-update, which replaces only the .exe, not the installer's
+    [Run]/[Registry] steps) and a tray that died earlier in the session.
+
+    Why a Scheduled Task instead of the old WMI-polling approach:
+      - "At log on" fires for whichever user logs in — Windows itself crosses
+        the Session 0 -> interactive-session boundary; no more querying
+        explorer.exe's owner via WMI to guess who to launch it as.
+      - A second trigger repeats every 3 min for as long as Windows is up,
+        with MultipleInstances=IgnoreNew: a no-op if the tray is alive, a
+        relaunch if it died. That watchdog used to only run once, when the
+        dispatcher service itself started — which could've been days ago —
+        so a tray crash mid-session was never noticed, let alone healed.
+      - ExecutionTimeLimit is explicitly set to unlimited. The previous
+        one-shot task left it at the Task Scheduler default, which silently
+        KILLS the process once the limit elapses — almost certainly the real
+        cause of "the tray dies and won't come back" whenever it had been
+        (re)launched through this fallback path instead of the old HKCU\\Run
+        key.
+
+    In interactive/dev mode (not running as a Windows service) there's no
+    session boundary to cross, so we just launch it directly.
     """
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return
 
-    exe_stem = Path(sys.executable).stem
-    ps_check = (
-        f"$r = Get-WmiObject Win32_Process "
-        f"| Where-Object {{ $_.Name -like '{exe_stem}*' -and $_.CommandLine -like '*--tray*' }}; "
-        f"if ($r) {{ exit 0 }} else {{ exit 1 }}"
-    )
-    try:
-        res = subprocess.run(
-            ["powershell", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_check],
-            capture_output=True, timeout=10,
-        )
-        if res.returncode == 0:
-            logger.debug("[tray] Tray already running — skip")
-            return
-    except Exception as e:
-        logger.debug(f"[tray] Could not check tray process: {e}")
+    if not _running_as_service():
+        _start_tray()
+        return
 
-    logger.info("[tray] Tray not running — launching...")
+    exe_path = str(Path(sys.executable).resolve())
 
-    if _running_as_service():
-        exe_path = Path(sys.executable)
-        ps = f"""
-$exe = '{exe_path}'
-$explorer = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
-if (-not $explorer) {{ Write-Host 'No interactive user logged in'; exit 0 }}
-$owner = $explorer.GetOwner()
-$user  = "$($owner.Domain)\\$($owner.User)"
-$action    = New-ScheduledTaskAction -Execute $exe -Argument '--tray'
-$trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-$settings  = New-ScheduledTaskSettingsSet -DeleteExpiredTaskAfter '00:01:00' -ExecutionTimeLimit '00:05:00'
-Unregister-ScheduledTask -TaskName 'AtanaTrayStart' -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName 'AtanaTrayStart' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName 'AtanaTrayStart'
-Write-Host "Tray launched for: $user"
+    # NOTE: kept in sync with installer/register_tray_task.ps1 (used by the
+    # installer's [Run] step) — this inline copy exists so clients that get
+    # this dispatcher version via auto-update (.exe swap only, no installer
+    # run) also end up with the task registered/repaired.
+    ps = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'AtanaTray'
+Unregister-ScheduledTask -TaskName 'AtanaTrayStart' -Confirm:$false
+
+$ErrorActionPreference = 'Stop'
+$action    = New-ScheduledTaskAction -Execute '{exe_path}' -Argument '--tray'
+$logon     = New-ScheduledTaskTrigger -AtLogOn
+$watchdog  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration ([TimeSpan]::MaxValue)
+$principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Limited
+$settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+Register-ScheduledTask -TaskName '{_TRAY_TASK_NAME}' -Action $action -Trigger @($logon, $watchdog) -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName '{_TRAY_TASK_NAME}'
+Write-Host 'Tray watchdog task registered and started'
 """
+    try:
         result = subprocess.run(
             ["powershell", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
             capture_output=True, text=True, timeout=20,
         )
-        out = result.stdout.strip()
         if result.returncode == 0:
-            logger.info(f"[tray] {out}")
+            logger.info(f"[tray] {result.stdout.strip()}")
         else:
-            logger.warning(f"[tray] Task Scheduler failed (rc={result.returncode}): {result.stderr.strip()}")
-    else:
-        _start_tray()
+            logger.warning(f"[tray] Task Scheduler setup failed (rc={result.returncode}): {result.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"[tray] Could not register tray watchdog task: {e}")
+
+
+def _tray_watchdog_check():
+    """
+    Periodic safety net for a tray that's still alive as a *process* but hung
+    (e.g. stuck on a blocking call) — MultipleInstances=IgnoreNew on the
+    Scheduled Task means Windows won't relaunch it in that case, since as far
+    as Windows is concerned the process never died. If the tray's heartbeat
+    (written every 30s via POST /tray/heartbeat) goes stale, kill the PID it
+    last reported so the watchdog task's next tick can bring up a fresh one.
+    """
+    if os.name != "nt":
+        return
+    try:
+        sys_cfg       = db.get_system_config()
+        heartbeat_raw = sys_cfg.get("tray_heartbeat")
+        pid_raw       = sys_cfg.get("tray_pid")
+        if not heartbeat_raw or not pid_raw:
+            return
+
+        heartbeat = datetime.fromisoformat(heartbeat_raw)
+        if datetime.now() - heartbeat < timedelta(minutes=_TRAY_HEARTBEAT_STALE_MIN):
+            return
+
+        pid = int(pid_raw)
+        logger.warning(f"[tray] Heartbeat stale (last: {heartbeat.isoformat()}) — killing hung tray PID {pid}")
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+    except Exception as e:
+        logger.debug(f"[tray] Watchdog check skipped: {e}")
 
 
 def process_jobs():
@@ -873,6 +892,15 @@ def main():
         id="fiserv_keepalive",
     )
 
+    # Kills a hung-but-alive tray process so the Scheduled Task watchdog can
+    # bring up a fresh one (see _tray_watchdog_check / _ensure_tray_supervised).
+    scheduler.add_job(
+        _tray_watchdog_check,
+        "interval",
+        minutes=2,
+        id="tray_watchdog_check",
+    )
+
     # Initial sync of per-provider cron jobs — dynamic refresh happens in process_jobs().
     if not args.run:
         _sync_scheduler_jobs()
@@ -880,10 +908,10 @@ def main():
     api.init(_config)
     api.start()
 
-    # Keep HKCU Run entry pointing to current exe (survives updates / path changes).
+    # Register/repair the Scheduled Task that supervises the tray icon and
+    # make sure one instance is running right now (see _ensure_tray_supervised).
     if not args.run:
-        _ensure_tray_registry()
-        _ensure_tray_running()
+        _ensure_tray_supervised()
 
     scheduler.start()
     logger.info("Dispatcher active — waiting for jobs or human intervention...")

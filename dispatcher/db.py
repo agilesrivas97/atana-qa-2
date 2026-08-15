@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import json
+import secrets
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -456,6 +457,183 @@ def set_system_config(key: str, value: str):
         """, key, value, key, value)
 
 
+# Logical (plaintext) keys that must be encrypted before being written to
+# system_config, and are stored under '<key>_enc'. Keep in sync with the
+# '_enc' columns documented in README.md's system_config table.
+_SYSTEM_SECRET_KEYS = {"smtp_password", "github_token"}
+
+# Master keys are never written through update_system_config — they have
+# their own rotate_* functions because changing them requires re-encrypting
+# (or invalidating) everything protected by the old value.
+_SYSTEM_PROTECTED_KEYS = {"fernet_key", "session_key", "api_key"}
+
+
+def get_system_config_masked() -> dict:
+    """
+    Same shape as get_system_config(), but NEVER decrypts. Secret keys
+    (suffix '_enc') come back as booleans '<key>_set' instead of the value.
+    Safe to expose over the API.
+    """
+    with connect() as conn:
+        rows = conn.execute("SELECT key_config, value_config FROM system_config").fetchall()
+
+    result = {}
+    for key, value in rows:
+        if key.endswith("_enc"):
+            result[f"{key[:-4]}_set"] = bool(value)
+        else:
+            result[key] = value
+    return result
+
+
+def update_system_config(fields: dict) -> None:
+    """
+    Bulk-updates system_config from plaintext logical keys (e.g. 'smtp_password',
+    'check_jobs_interval_min'). Keys in _SYSTEM_SECRET_KEYS are encrypted here
+    and stored as '<key>_enc'; everything else is written as-is.
+    Master keys (fernet_key/session_key/api_key) are rejected — use
+    rotate_fernet_key() / rotate_session_key() / rotate_api_key() instead.
+    """
+    for key in fields:
+        if key in _SYSTEM_PROTECTED_KEYS:
+            raise ValueError(f"'{key}' cannot be set directly — use the rotate_* functions")
+
+    for key, value in fields.items():
+        if key in _SYSTEM_SECRET_KEYS:
+            set_system_config(f"{key}_enc", encrypt_value(value).decode() if value else "")
+        else:
+            set_system_config(key, value)
+
+
+def set_tray_heartbeat(pid: int) -> None:
+    """
+    Records the tray's last-alive signal. Read back by dispatcher/main.py's
+    _tray_watchdog_check() to detect a tray that's still running but hung.
+    """
+    set_system_config("tray_heartbeat", datetime.now().isoformat())
+    set_system_config("tray_pid", str(pid))
+
+
+def rotate_api_key() -> str:
+    """Generates and persists a new local API key (dispatcher <-> tray/panel). Returns it."""
+    new_key = secrets.token_urlsafe(30)
+    set_system_config("api_key", new_key)
+    return new_key
+
+
+def rotate_fernet_key() -> dict:
+    """
+    Generates a new fernet_key and re-encrypts everything protected by the
+    current one: agent_config.password_enc, the '_enc' sub-fields (and
+    mercadopago's accounts[].access_token_enc) inside agent_config.extra_config,
+    and every '_enc' key in system_config.
+
+    Runs as a single DB transaction: every row is decrypted with the OLD key
+    and re-encrypted with the NEW key in memory first, and the new fernet_key
+    is only written to system_config as the very last statement. If any row
+    fails to decrypt (wrong/corrupted old key), the exception propagates and
+    connect() rolls back the whole transaction — the old key stays in effect
+    and nothing is left half-migrated.
+    """
+    global _fernet
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value_config FROM system_config WHERE key_config = 'fernet_key'"
+        ).fetchone()
+        if not row or not row[0]:
+            raise RuntimeError("No fernet_key configured — nothing to rotate")
+
+        old_f   = Fernet(row[0].encode())
+        new_key = Fernet.generate_key()
+        new_f   = Fernet(new_key)
+
+        agents_updated = 0
+        agent_rows = conn.execute(
+            "SELECT provider, password_enc, extra_config FROM agent_config"
+        ).fetchall()
+
+        for provider, password_enc, extra_config in agent_rows:
+            new_password_enc = None
+            if password_enc:
+                raw = password_enc if isinstance(password_enc, bytes) else bytes(password_enc)
+                new_password_enc = new_f.encrypt(old_f.decrypt(raw))
+
+            new_extra = None
+            if extra_config:
+                try:
+                    extra = json.loads(extra_config)
+                except (json.JSONDecodeError, TypeError):
+                    extra = {}
+
+                for k, v in list(extra.items()):
+                    if k.endswith("_enc") and v:
+                        raw = v.encode() if isinstance(v, str) else v
+                        extra[k] = new_f.encrypt(old_f.decrypt(raw)).decode()
+                    elif k == "accounts" and isinstance(v, list):
+                        for acc in v:
+                            token_enc = acc.get("access_token_enc")
+                            if token_enc:
+                                raw = token_enc.encode() if isinstance(token_enc, str) else token_enc
+                                acc["access_token_enc"] = new_f.encrypt(old_f.decrypt(raw)).decode()
+                new_extra = json.dumps(extra)
+
+            conn.execute(
+                "UPDATE agent_config SET password_enc = ?, extra_config = ? WHERE provider = ?",
+                new_password_enc, new_extra, provider,
+            )
+            agents_updated += 1
+
+        sys_updated = 0
+        sys_rows = conn.execute("SELECT key_config, value_config FROM system_config").fetchall()
+        for key_config, value_config in sys_rows:
+            if not key_config.endswith("_enc") or not value_config:
+                continue
+            raw = value_config.encode() if isinstance(value_config, str) else value_config
+            new_value = new_f.encrypt(old_f.decrypt(raw)).decode()
+            conn.execute(
+                "UPDATE system_config SET value_config = ?, updated_at = GETDATE() WHERE key_config = ?",
+                new_value, key_config,
+            )
+            sys_updated += 1
+
+        # Written LAST — if anything above raised, this never runs and the
+        # whole transaction (including the UPDATEs above) rolls back.
+        conn.execute(
+            "UPDATE system_config SET value_config = ?, updated_at = GETDATE() WHERE key_config = 'fernet_key'",
+            new_key.decode(),
+        )
+
+    # Committed successfully — drop the cached Fernet instance so the next
+    # _get_fernet() call reloads and picks up the new key.
+    _fernet = None
+
+    return {"agents_updated": agents_updated, "system_keys_updated": sys_updated}
+
+
+def rotate_session_key() -> dict:
+    """
+    Generates a new session_key. Browser sessions in session_store are
+    ephemeral and already re-creatable by design (agents re-login whenever a
+    session is missing/invalid — see session_store.py), so instead of
+    re-encrypting them in place we simply invalidate every existing session
+    and let agents recapture them on their next run under the new key.
+
+    Returns the new key under 'new_key' so the caller (dispatcher/api.py) can
+    immediately refresh shared.session_store's in-memory Fernet instance —
+    NEVER expose 'new_key' in an HTTP response.
+    """
+    new_key = Fernet.generate_key().decode()
+    with connect() as conn:
+        result = conn.execute("UPDATE session_store SET valid = 0")
+        sessions_invalidated = result.rowcount if result.rowcount is not None else 0
+        conn.execute(
+            "UPDATE system_config SET value_config = ?, updated_at = GETDATE() WHERE key_config = 'session_key'",
+            new_key,
+        )
+    return {"sessions_invalidated": sessions_invalidated, "new_key": new_key}
+
+
 # ── Agent config ──────────────────────────────────────────────────────────────
 
 def _decode_agent_row(row: dict) -> dict:
@@ -533,6 +711,184 @@ def get_all_agent_configs() -> list[dict]:
             ORDER BY provider
         """).fetchall()
     return [_decode_agent_row(_row_to_dict(r)) for r in rows]
+
+
+_AGENT_CONFIG_COLUMNS = """
+    provider, enabled, username, password_enc, destination_folder,
+    rename_pattern, max_retries, retry_interval_min, portal_url,
+    schedule_hour, schedule_minute, extra_config
+"""
+
+# Columns updatable as-is (no encryption, no extra_config merge) via update_agent_config.
+_AGENT_TOP_LEVEL_COLUMNS = {
+    "enabled", "username", "destination_folder", "rename_pattern",
+    "max_retries", "retry_interval_min", "portal_url",
+    "schedule_hour", "schedule_minute",
+}
+
+# Logical extra_config field names that must be encrypted (stored as '<field>_enc').
+# Extend this when a new agent introduces a new secret field.
+_AGENT_SECRET_EXTRA_FIELDS = {
+    "fiserv":      {"totp_secret"},
+    "naranjax":    {"imap_password"},
+    "mercadopago": set(),  # handled via the 'accounts' special-case below
+}
+
+
+def _mask_agent_row(row: dict) -> dict:
+    """
+    Like _decode_agent_row, but NEVER decrypts — secret fields become
+    booleans ('<field>_set') instead of the value. Safe to expose over the API.
+    """
+    cfg = dict(row)
+
+    cfg["has_password"] = bool(cfg.get("password_enc"))
+    cfg.pop("password_enc", None)
+
+    extra_raw = cfg.pop("extra_config", None)
+    if extra_raw:
+        try:
+            extra = json.loads(extra_raw)
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+
+        masked_extra = {}
+        for k, v in extra.items():
+            if k.endswith("_enc"):
+                masked_extra[f"{k[:-4]}_set"] = bool(v)
+            elif k == "accounts" and isinstance(v, list):
+                masked_extra["accounts"] = [
+                    {
+                        **{kk: vv for kk, vv in acc.items() if kk != "access_token_enc"},
+                        "access_token_set": bool(acc.get("access_token_enc")),
+                    }
+                    for acc in v
+                ]
+            else:
+                masked_extra[k] = v
+
+        cfg.update(masked_extra)
+
+    return cfg
+
+
+def get_agent_config_masked(provider: str) -> Optional[dict]:
+    """Returns the config for a single provider with all secrets masked (never decrypted)."""
+    with connect() as conn:
+        row = conn.execute(f"""
+            SELECT {_AGENT_CONFIG_COLUMNS}
+            FROM agent_config
+            WHERE provider = ?
+        """, provider).fetchone()
+    if not row:
+        return None
+    return _mask_agent_row(_row_to_dict(row))
+
+
+def get_all_agent_configs_masked() -> list[dict]:
+    """Returns all agent configs with all secrets masked (never decrypted). Safe for the API."""
+    with connect() as conn:
+        rows = conn.execute(f"""
+            SELECT {_AGENT_CONFIG_COLUMNS}
+            FROM agent_config
+            ORDER BY provider
+        """).fetchall()
+    return [_mask_agent_row(_row_to_dict(r)) for r in rows]
+
+
+def update_agent_config(provider: str, fields: dict) -> bool:
+    """
+    Updates agent_config for `provider` from plaintext logical keys — the same
+    shape returned by get_agent_config()/_decode_agent_row (e.g. 'password',
+    'totp_secret', 'accounts': [{'alias':.., 'access_token':..}], 'enabled', ...).
+    Secret fields are encrypted with the current fernet_key before writing.
+    Only keys present in `fields` are touched; everything else is left as-is.
+    Returns False if `fields` was empty (nothing to do) or the provider doesn't exist.
+    """
+    if not fields:
+        return False
+
+    set_clauses: list[str] = []
+    params: list = []
+
+    for col in _AGENT_TOP_LEVEL_COLUMNS:
+        if col in fields:
+            value = fields[col]
+            if col == "enabled":
+                value = 1 if value else 0
+            set_clauses.append(f"{col} = ?")
+            params.append(value)
+
+    if "password" in fields:
+        set_clauses.append("password_enc = ?")
+        pwd = fields["password"]
+        params.append(encrypt_value(pwd) if pwd else None)
+
+    extra_keys = set(fields) - _AGENT_TOP_LEVEL_COLUMNS - {"password", "provider"}
+    if extra_keys:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT extra_config FROM agent_config WHERE provider = ?", provider
+            ).fetchone()
+        existing_raw = row[0] if row else None
+        try:
+            existing = json.loads(existing_raw) if existing_raw else {}
+        except (json.JSONDecodeError, TypeError):
+            existing = {}
+
+        secret_fields = _AGENT_SECRET_EXTRA_FIELDS.get(provider, set())
+
+        for key in extra_keys:
+            value = fields[key]
+            if key == "accounts" and isinstance(value, list):
+                # The caller (panel) only ever sees the MASKED accounts list —
+                # it never has the encrypted token for an account it didn't
+                # just edit. Merge by alias instead of a blind overwrite, so
+                # sending the list back after e.g. renaming an alias doesn't
+                # silently wipe every other account's token.
+                existing_by_alias = {
+                    a.get("alias"): a for a in existing.get("accounts", []) if isinstance(a, dict)
+                }
+                accounts = []
+                for acc in value:
+                    acc   = dict(acc)
+                    alias = acc.get("alias")
+                    if "access_token" in acc:
+                        token = acc.pop("access_token")
+                        acc["access_token_enc"] = encrypt_value(token).decode() if token else ""
+                    elif "access_token_enc" not in acc and alias in existing_by_alias:
+                        prev = existing_by_alias[alias].get("access_token_enc")
+                        if prev:
+                            acc["access_token_enc"] = prev
+                    accounts.append(acc)
+                existing["accounts"] = accounts
+            elif key in secret_fields or f"{key}_enc" in existing:
+                # In the registry (new field for this provider) OR already
+                # stored encrypted under this name (mirrors _mask_agent_row's
+                # read-side detection) — either way, keep it encrypted rather
+                # than silently downgrading it to plaintext because someone
+                # forgot to add it to _AGENT_SECRET_EXTRA_FIELDS.
+                existing[f"{key}_enc"] = encrypt_value(value).decode() if value else ""
+                existing.pop(key, None)
+            else:
+                existing[key] = value
+
+        set_clauses.append("extra_config = ?")
+        params.append(json.dumps(existing))
+
+    if not set_clauses:
+        return False
+
+    set_clauses.append("updated_at = GETDATE()")
+    params.append(provider)
+
+    with connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE agent_config SET {', '.join(set_clauses)} WHERE provider = ?",
+            *params,
+        )
+        updated = cursor.rowcount if cursor.rowcount is not None else 0
+    return updated > 0
 
 
 # ── Session store ─────────────────────────────────────────────────────────────
