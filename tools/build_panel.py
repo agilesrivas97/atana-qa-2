@@ -63,6 +63,8 @@ def main():
         # UI modules loaded by ui/panel_main.py
         "--hidden-import", "ui.panel_app",
         "--hidden-import", "ui.config_panel",
+        "--hidden-import", "ui.totp_tool",
+        "--hidden-import", "ui.async_utils",
         "--hidden-import", "shared.api_client",
         "--hidden-import", "shared.totp_extractor",
         "--hidden-import", "shared.paths",

@@ -4,14 +4,24 @@ ui/config_panel.py
 "Configuración" tab: system-wide settings (General / SMTP / Auto-update) plus
 one tab per agent, generated dynamically from GET /config/agents.
 
-Everything here goes through shared/api_client.py — the panel never keeps a
-decrypted secret around. Every secret field shows "configurado / no
-configurado" plus a "🔄 Reemplazar" button; the dialog pre-fills the CURRENT
-value (fetched on demand, plaintext, over the same authenticated local API —
-see GET /config/agents/{provider}/secret/{field} in dispatcher/api.py) so the
+Everything here goes through shared/api_client.py — NEVER SQL Server
+directly. The panel doesn't keep a decrypted secret around either: every
+secret field shows "configurado / no configurado" plus a "🔄 Reemplazar"
+button; the dialog pre-fills the CURRENT value (fetched on demand, plaintext,
+over the same authenticated local API — see
+GET /config/agents/{provider}/secret/{field} in dispatcher/api.py) so the
 user can see and edit it instead of typing blind. The value the user ends up
 with is sent back and encrypted server-side (dispatcher/db.py) before it ever
 touches the database.
+
+Loading: every tab that needs data shows a "Cargando..." placeholder first —
+window and Notebook appear instantly — and gets populated once its
+GET finishes, via ui/async_utils.run_async_retrying (background thread +
+Tk-safe handoff, retries the odd transient failure right after the panel
+opens). Two shared fetches feed the whole ConfigTab: one GET /config/system
+for General+SMTP+Auto-update (used to be 3 separate round-trips — one per
+tab — which is why this used to feel slow to open), one GET /config/agents
+for every agent tab.
 
 Saving: a single "💾 Guardar todo" button lives in ConfigTab, above the
 sub-tabs, and saves every tab's plain fields in one shot — no per-tab save
@@ -23,17 +33,16 @@ form state.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from loguru import logger
-
 from shared.api_client import ApiClient, ApiError
+from ui.async_utils import run_async_retrying
 
 _FIELD_FONT = ("Segoe UI", 10)
 _LABEL_FONT = ("Segoe UI", 10, "bold")
 
 _AGENT_TOP_LEVEL_FIELDS = [
-    # (key, label, kind)  kind in {str, int, bool, folder}
+    # (key, label, kind)  kind in {str, int, bool, folder} — 'username' excluded,
+    # it's rendered inside the CREDENCIALES group instead (see AgentConfigTab).
     ("enabled",            "Habilitado",                 "bool"),
-    ("username",           "Usuario",                    "str"),
     ("destination_folder", "Carpeta de destino",         "folder"),
     ("rename_pattern",     "Patrón de renombrado",       "str"),
     ("portal_url",         "URL del portal",              "str"),
@@ -42,7 +51,10 @@ _AGENT_TOP_LEVEL_FIELDS = [
     ("max_retries",        "Reintentos máximos",         "int"),
     ("retry_interval_min", "Minutos entre reintentos",   "int"),
 ]
-_AGENT_TOP_LEVEL_KEYS = {k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS} | {"provider", "has_password", "available"}
+_AGENT_TOP_LEVEL_KEYS = (
+    {k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS}
+    | {"provider", "has_password", "available", "username"}
+)
 
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
@@ -95,23 +107,72 @@ def _confirm(parent, title: str, message: str) -> bool:
     return messagebox.askyesno(title, message, parent=parent)
 
 
+class _LoadingPlaceholder(ttk.Frame):
+    """Centered 'Cargando...' shown the instant a tab is created, before its
+    data has come back from the API."""
+
+    def __init__(self, parent, text: str = "Cargando..."):
+        super().__init__(parent)
+        wrap = tk.Frame(self)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+        tk.Label(wrap, text=text, font=("Segoe UI", 11), fg="#999999").pack()
+
+    def save(self) -> bool:
+        return True
+
+
 class _SettingsTabBase(ttk.Frame):
-    """Common scaffolding for a settings form: a grid of labeled fields plus
-    a small status label (no button — saving is global, see ConfigTab)."""
+    """
+    Common scaffolding for a settings form: shows a 'Cargando...' placeholder
+    on construction (no network call happens in __init__ — see ConfigTab,
+    which fetches once and calls populate() on every tab when the data is
+    in), then a grid of labeled fields plus a small status label (no
+    button — saving is global, see ConfigTab) once populate() runs.
+
+    Supports one nested "grouped" section (used for the CREDENCIALES box —
+    usuario/password/tokens visually separated from the rest) via
+    _start_group()/_end_group(): fields added in between go inside a
+    LabelFrame instead of directly on the tab.
+    """
 
     def __init__(self, parent, api: ApiClient, title: str):
         super().__init__(parent)
         self.api = api
+        self._title = title
         self._vars: dict[str, tk.Variable] = {}
         self._row = 0
         self._save_status: tk.Label | None = None
+        self.form = self
 
-        tk.Label(self, text=title, font=("Segoe UI", 13, "bold")).grid(
+        self._loading = tk.Label(self, text=f"{title}\n\nCargando...", font=("Segoe UI", 11), fg="#999999")
+        self._loading.place(relx=0.5, rely=0.4, anchor="center")
+
+    def _start_form(self):
+        """Call once, at the top of populate() — clears the loading
+        placeholder and starts the real grid layout."""
+        self._loading.destroy()
+        tk.Label(self, text=self._title, font=("Segoe UI", 13, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 8),
         )
         self._row = 1
 
-        self.form = self  # subclasses may override to nest a sub-frame
+    def _start_group(self, title: str):
+        """Opens a bordered LabelFrame ('CREDENCIALES', etc) — subsequent
+        _add_field/_add_secret_row calls land inside it until _end_group()."""
+        row = self._row
+        box = tk.LabelFrame(self, text=title, font=_LABEL_FONT, padx=12, pady=8)
+        box.grid(row=row, column=0, columnspan=3, sticky="we", padx=16, pady=(4, 10))
+        box.grid_columnconfigure(1, weight=1)
+        self._row += 1
+
+        self._outer_form = self.form
+        self._outer_row  = self._row
+        self.form = box
+        self._row = 0
+
+    def _end_group(self):
+        self.form = self._outer_form
+        self._row = self._outer_row
 
     def _add_field(self, key: str, label: str, kind: str, value):
         row = self._row
@@ -187,7 +248,9 @@ class _SettingsTabBase(ttk.Frame):
         self.after(4000, lambda: self._save_status.config(text=""))
 
     def save(self) -> bool:
-        """Overridden by subclasses. Returns True on success."""
+        """Overridden by subclasses. Returns True on success. A tab that
+        hasn't finished loading yet (still showing 'Cargando...') has
+        nothing to save — no-op."""
         return True
 
 
@@ -199,15 +262,10 @@ class GeneralSettingsTab(_SettingsTabBase):
 
     def __init__(self, parent, api: ApiClient):
         super().__init__(parent, api, "Configuración general")
-        self._load()
+        self._loaded = False
 
-    def _load(self):
-        try:
-            sys_cfg = self.api.get("/config/system").get("system", {})
-        except ApiError as e:
-            messagebox.showwarning("ATANA", f"No se pudo cargar la configuración: {e}", parent=self)
-            sys_cfg = {}
-
+    def populate(self, sys_cfg: dict):
+        self._start_form()
         self._add_field("check_jobs_interval_min",     "Minutos entre chequeos de jobs",      "str", sys_cfg.get("check_jobs_interval_min", 5))
         self._add_field("check_update_interval_hours", "Horas entre chequeos de actualización", "str", sys_cfg.get("check_update_interval_hours", 6))
         self._add_field("api_port",                    "Puerto de la API interna",             "str", sys_cfg.get("api_port", 8765))
@@ -216,8 +274,11 @@ class GeneralSettingsTab(_SettingsTabBase):
         self._status_row()
         self._build_operation_section()
         self._build_security_section()
+        self._loaded = True
 
     def save(self) -> bool:
+        if not self._loaded:
+            return True
         body = self._collect_plain(list(self._INT_FIELDS))
         body["debug"] = "true" if self._vars["debug"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
@@ -339,29 +400,30 @@ class SmtpSettingsTab(_SettingsTabBase):
 
     def __init__(self, parent, api: ApiClient):
         super().__init__(parent, api, "Notificaciones por SMTP")
-        self._load()
+        self._loaded = False
 
-    def _load(self):
-        try:
-            sys_cfg = self.api.get("/config/system").get("system", {})
-        except ApiError as e:
-            messagebox.showwarning("ATANA", f"No se pudo cargar SMTP: {e}", parent=self)
-            sys_cfg = {}
+    def populate(self, sys_cfg: dict):
+        self._start_form()
 
-        self._add_field("smtp_enabled",   "Notificaciones activas", "bool", str(sys_cfg.get("smtp_enabled", "")).lower() == "true")
-        self._add_field("smtp_host",      "Servidor SMTP",          "str",  sys_cfg.get("smtp_host", ""))
-        self._add_field("smtp_port",      "Puerto",                 "str",  sys_cfg.get("smtp_port", 587))
-        self._add_field("smtp_username",  "Usuario / remitente",    "str",  sys_cfg.get("smtp_username", ""))
-        self._add_field("smtp_recipient", "Destinatario de alertas", "str", sys_cfg.get("smtp_recipient", ""))
-
+        self._start_group("CREDENCIALES")
+        self._add_field("smtp_username", "Usuario / remitente", "str", sys_cfg.get("smtp_username", ""))
         self._add_secret_row(
             "smtp_password", "Contraseña", bool(sys_cfg.get("smtp_password_set")),
             on_replace=self._replace_password,
         )
+        self._end_group()
+
+        self._add_field("smtp_enabled",   "Notificaciones activas",  "bool", str(sys_cfg.get("smtp_enabled", "")).lower() == "true")
+        self._add_field("smtp_host",      "Servidor SMTP",           "str",  sys_cfg.get("smtp_host", ""))
+        self._add_field("smtp_port",      "Puerto",                  "str",  sys_cfg.get("smtp_port", 587))
+        self._add_field("smtp_recipient", "Destinatario de alertas", "str",  sys_cfg.get("smtp_recipient", ""))
 
         self._status_row()
+        self._loaded = True
 
     def save(self) -> bool:
+        if not self._loaded:
+            return True
         body = self._collect_plain(["smtp_host", "smtp_port", "smtp_username", "smtp_recipient"])
         body["smtp_enabled"] = "true" if self._vars["smtp_enabled"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
@@ -394,22 +456,20 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
 
     def __init__(self, parent, api: ApiClient):
         super().__init__(parent, api, "Auto-update (GitHub Releases)")
-        self._load()
+        self._loaded = False
 
-    def _load(self):
-        try:
-            sys_cfg = self.api.get("/config/system").get("system", {})
-        except ApiError as e:
-            messagebox.showwarning("ATANA", f"No se pudo cargar Auto-update: {e}", parent=self)
-            sys_cfg = {}
+    def populate(self, sys_cfg: dict):
+        self._start_form()
 
-        self._add_field("github_owner", "Usuario / organización", "str", sys_cfg.get("github_owner", ""))
-        self._add_field("github_repo",  "Repositorio",            "str", sys_cfg.get("github_repo", ""))
-
+        self._start_group("CREDENCIALES")
         self._add_secret_row(
             "github_token", "Personal Access Token", bool(sys_cfg.get("github_token_set")),
             on_replace=self._replace_token,
         )
+        self._end_group()
+
+        self._add_field("github_owner", "Usuario / organización", "str", sys_cfg.get("github_owner", ""))
+        self._add_field("github_repo",  "Repositorio",            "str", sys_cfg.get("github_repo", ""))
 
         tk.Label(
             self, text="Dejar el token en blanco desactiva el auto-update.",
@@ -418,8 +478,11 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
         self._row += 1
 
         self._status_row()
+        self._loaded = True
 
     def save(self) -> bool:
+        if not self._loaded:
+            return True
         body = self._collect_plain(["github_owner", "github_repo"])
         body = {k: v for k, v in body.items() if v is not None}
         try:
@@ -451,9 +514,14 @@ class AgentConfigTab(_SettingsTabBase):
     """
     Renders the common agent_config columns plus whatever provider-specific
     extra_config fields the API returned — generically: any '<x>_set' key
-    becomes a secret-replace row, 'accounts' gets its own mini list editor,
-    everything else is a plain field. This means a brand-new agent with a new
-    extra_config schema gets a reasonable form for free, no code changes here.
+    becomes a secret-replace row inside CREDENCIALES, 'accounts' gets its own
+    mini list editor (also inside CREDENCIALES), everything else is a plain
+    field below. This means a brand-new agent with a new extra_config schema
+    gets a reasonable form for free, no code changes here.
+
+    Built with `agent` already in hand (ConfigTab fetches every agent's
+    config in one GET /config/agents) — no loading placeholder needed, no
+    per-tab network call.
     """
 
     def __init__(self, parent, api: ApiClient, provider: str, agent: dict):
@@ -461,14 +529,16 @@ class AgentConfigTab(_SettingsTabBase):
         self.provider = provider
         self._extra_plain_keys: list[str] = []
         self._accounts: list[dict] = []
+        self._start_form()
         self._build(agent)
 
     def _build(self, agent: dict):
-        for key, label, kind in _AGENT_TOP_LEVEL_FIELDS:
-            self._add_field(key, label, kind, agent.get(key))
+        # ── CREDENCIALES ──────────────────────────────────────────────────
+        self._start_group("CREDENCIALES")
 
+        self._add_field("username", "Usuario", "str", agent.get("username"))
         self._add_secret_row(
-            "password", "Contraseña del portal", bool(agent.get("has_password")),
+            "password", "Contraseña / Token", bool(agent.get("has_password")),
             on_replace=self._replace_password,
         )
 
@@ -480,21 +550,32 @@ class AgentConfigTab(_SettingsTabBase):
                 self._build_accounts_section()
             elif key.endswith("_set"):
                 logical = key[:-4]
-                extra_qr = self._qr_button(logical) if logical == "totp_secret" else None
+                is_totp = logical == "totp_secret"
                 self._add_secret_row(
-                    logical, logical.replace("_", " ").capitalize(), bool(value),
+                    logical,
+                    "TOTP (Google Authenticator)" if is_totp else logical.replace("_", " ").capitalize(),
+                    bool(value),
                     on_replace=lambda k=logical: self._replace_extra_secret(k),
-                    extra=extra_qr,
+                    extra=self._qr_button(logical) if is_totp else None,
                 )
-            else:
-                self._extra_plain_keys.append(key)
-                self._add_field(key, key.replace("_", " ").capitalize(), "str", value)
+
+        self._end_group()
+
+        # ── otras cosas ───────────────────────────────────────────────────
+        for key, label, kind in _AGENT_TOP_LEVEL_FIELDS:
+            self._add_field(key, label, kind, agent.get(key))
+
+        for key, value in agent.items():
+            if key in _AGENT_TOP_LEVEL_KEYS or key == "accounts" or key.endswith("_set"):
+                continue
+            self._extra_plain_keys.append(key)
+            self._add_field(key, key.replace("_", " ").capitalize(), "str", value)
 
         self._status_row()
 
     def save(self) -> bool:
         body = self._collect_plain(
-            [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"] + self._extra_plain_keys
+            ["username"] + [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"] + self._extra_plain_keys
         )
         body["enabled"] = self._vars["enabled"].get()
         for k in ("schedule_hour", "schedule_minute", "max_retries", "retry_interval_min"):
@@ -518,7 +599,7 @@ class AgentConfigTab(_SettingsTabBase):
             current = self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", "")
         except ApiError:
             current = ""
-        value = _ask_secret(self, f"Contraseña — {self.provider.upper()}", "Usuario y contraseña del portal:", initial=current)
+        value = _ask_secret(self, f"Contraseña — {self.provider.upper()}", "Contraseña / token del portal:", initial=current)
         if value is None:
             return
         self._put_secret({"password": value})
@@ -540,17 +621,25 @@ class AgentConfigTab(_SettingsTabBase):
         except ApiError as e:
             messagebox.showerror("ATANA", f"No se pudo guardar: {e}", parent=self)
 
+    # ── TOTP desde foto del QR ────────────────────────────────────────────
+    # El único paso "raro" del alta de un agente con 2FA: en vez de pedirle al
+    # cliente el secreto en texto, le sacamos una foto al QR de Google
+    # Authenticator y lo leemos acá mismo. La imagen nunca sale de la máquina
+    # ni pasa por la API — se decodifica en el proceso del panel
+    # (shared/totp_extractor.py) y solo el secreto ya extraído se manda a
+    # guardar (cifrado server-side, como cualquier otro secreto).
+
     def _qr_button(self, logical_key: str):
         def _factory(parent_frame):
             tk.Button(
-                parent_frame, text="📷 Subir QR", relief="flat", cursor="hand2",
+                parent_frame, text="📷 Generar desde foto del QR", relief="flat", cursor="hand2",
                 command=lambda: self._upload_qr(logical_key),
             ).pack(side="left", padx=(6, 0))
         return _factory
 
     def _upload_qr(self, logical_key: str):
         path = filedialog.askopenfilename(
-            title="Seleccioná la imagen del QR",
+            title="Seleccioná la foto del QR (Google Authenticator)",
             filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp"), ("Todos los archivos", "*.*")],
         )
         if not path:
@@ -577,11 +666,13 @@ class AgentConfigTab(_SettingsTabBase):
 
     # ── accounts (MercadoPago y cualquier agente con múltiples cuentas) ──
     # Sin límite de cantidad — "+ Agregar cuenta" siempre agrega una más.
+    # Vive dentro de CREDENCIALES (se llama desde _build, entre _start_group
+    # y _end_group).
 
     def _build_accounts_section(self):
         row = self._row
-        box = tk.LabelFrame(self, text="Cuentas", font=_LABEL_FONT, padx=10, pady=10)
-        box.grid(row=row, column=0, columnspan=3, sticky="we", padx=16, pady=8)
+        box = tk.LabelFrame(self.form, text="Cuentas", font=_LABEL_FONT, padx=10, pady=10)
+        box.grid(row=row, column=0, columnspan=3, sticky="we", padx=4, pady=8)
         self._row += 1
 
         self._accounts_list = tk.Frame(box)
@@ -714,6 +805,13 @@ class _UnavailableAgentTab(ttk.Frame):
 # ── Orchestrator tab ─────────────────────────────────────────────────────
 
 class ConfigTab(ttk.Frame):
+    """
+    Builds its whole shell (header + Notebook + one placeholder tab each)
+    synchronously — this is all just widget construction, no network calls,
+    so the window appears immediately. The two GETs that feed every tab
+    (/config/system, /config/agents) run in the background via
+    run_async_retrying and populate tabs in place once they land.
+    """
 
     def __init__(self, parent, api: ApiClient):
         super().__init__(parent)
@@ -735,24 +833,43 @@ class ConfigTab(ttk.Frame):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        core_tabs = [
-            (GeneralSettingsTab(self.notebook, api),    "General"),
-            (SmtpSettingsTab(self.notebook, api),       "SMTP"),
-            (AutoUpdateSettingsTab(self.notebook, api), "Auto-update"),
-        ]
-        for tab, label in core_tabs:
+        self.general_tab = GeneralSettingsTab(self.notebook, api)
+        self.smtp_tab    = SmtpSettingsTab(self.notebook, api)
+        self.update_tab  = AutoUpdateSettingsTab(self.notebook, api)
+        for tab, label in ((self.general_tab, "General"), (self.smtp_tab, "SMTP"), (self.update_tab, "Auto-update")):
             self.notebook.add(tab, text=label)
             self._savable_tabs.append(tab)
 
-        self._load_agent_tabs()
+        self._agents_placeholder = _LoadingPlaceholder(self.notebook, "Cargando agentes...")
+        self.notebook.add(self._agents_placeholder, text="Agentes")
 
-    def _load_agent_tabs(self):
-        try:
-            agents = self.api.get("/config/agents").get("agents", [])
-        except ApiError as e:
-            logger.warning(f"Could not load agent configs: {e}")
-            messagebox.showwarning("ATANA", f"No se pudo cargar la configuración de agentes: {e}", parent=self)
-            return
+        # retrying, not one-shot: right after the panel opens, the dispatcher's
+        # local API may not have bound its port yet (window shows up first) —
+        # a few quick retries absorb that instead of surfacing a one-off
+        # "<urlopen error ...>" that then works fine a second later anyway.
+        run_async_retrying(
+            self, work=lambda: self.api.get("/config/system").get("system", {}),
+            on_done=self._on_system_loaded,
+            on_final_error=lambda e: messagebox.showwarning(
+                "ATANA", f"No se pudo cargar la configuración: {e}", parent=self,
+            ),
+        )
+        run_async_retrying(
+            self, work=lambda: self.api.get("/config/agents").get("agents", []),
+            on_done=self._on_agents_loaded,
+            on_final_error=lambda e: messagebox.showwarning(
+                "ATANA", f"No se pudo cargar la configuración de agentes: {e}", parent=self,
+            ),
+        )
+
+    def _on_system_loaded(self, sys_cfg: dict):
+        self.general_tab.populate(sys_cfg)
+        self.smtp_tab.populate(sys_cfg)
+        self.update_tab.populate(sys_cfg)
+
+    def _on_agents_loaded(self, agents: list):
+        self.notebook.forget(self._agents_placeholder)
+        self._agents_placeholder.destroy()
 
         for agent in sorted(agents, key=lambda a: a.get("provider", "")):
             provider = agent["provider"]

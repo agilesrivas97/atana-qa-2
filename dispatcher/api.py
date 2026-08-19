@@ -11,7 +11,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -48,7 +48,12 @@ def start():
 
 def _run():
     try:
-        server = HTTPServer(("localhost", _port), _Handler)
+        # Threading (not plain HTTPServer): the panel opens with several
+        # concurrent-ish calls (tabs loading, tray polling /status every 30s,
+        # a rotate-master running in its own background thread) — no reason
+        # to serialize all of that through one connection at a time.
+        server = ThreadingHTTPServer(("localhost", _port), _Handler)
+        server.daemon_threads = True
         server.serve_forever()
     except OSError as e:
         if e.errno == 48:

@@ -15,7 +15,9 @@ from loguru import logger
 
 from shared.api_client import ApiClient, ApiError
 from shared.paths import BASE_DIR as _BASE_DIR
+from ui.async_utils import run_async_retrying
 from ui.config_panel import ConfigTab
+from ui.totp_tool import TotpToolTab
 
 
 class PanelApp:
@@ -35,9 +37,11 @@ class PanelApp:
         self.notebook.pack(fill="both", expand=True)
 
         self.overview_tab = OverviewTab(self.notebook, self.api)
+        self.totp_tab     = TotpToolTab(self.notebook, self.api)
         self.config_tab   = ConfigTab(self.notebook, self.api)
 
         self.notebook.add(self.overview_tab, text="  General  ")
+        self.notebook.add(self.totp_tab,     text="  TOTP  ")
         self.notebook.add(self.config_tab,   text="  Configuración  ")
 
         if open_config:
@@ -207,10 +211,31 @@ class OverviewTab(ttk.Frame):
         self._refresh()
 
     def _refresh(self):
-        try:
-            status_resp = self.api.get("/status")
-            agents_resp = self.api.get("/config/agents")
+        """
+        Fetches /status + /config/agents on a background thread — these used
+        to run synchronously here, which meant the whole panel window
+        couldn't appear until both round-trips (and the SQL Server hits
+        behind them) finished. Retries a few times before giving up — right
+        after the panel opens, the dispatcher's local API may not have bound
+        its port yet (window shows up first), which used to surface as a
+        one-off "<urlopen error ...>" that then worked fine a second later
+        anyway. Always ends up rescheduling itself for the next cycle,
+        success or not.
+        """
+        run_async_retrying(
+            self,
+            work=lambda: (self.api.get("/status"), self.api.get("/config/agents")),
+            on_done=self._apply_refresh,
+            on_final_error=self._on_refresh_error,
+        )
 
+    def _on_refresh_error(self, e: Exception):
+        self._log(None, "error", f"No se pudo conectar con el dispatcher: {e}")
+        self.after(30_000, self._refresh)
+
+    def _apply_refresh(self, resp: tuple):
+        status_resp, agents_resp = resp
+        try:
             agent_cfgs = {a["provider"]: a for a in agents_resp.get("agents", []) if a.get("enabled")}
             enabled    = set(agent_cfgs)
 
@@ -235,8 +260,6 @@ class OverviewTab(ttk.Frame):
             self._update_table(statuses, int_providers)
 
             self.lbl_last.config(text=f"Updated: {datetime.now().strftime('%H:%M:%S')}")
-        except ApiError as e:
-            self._log(None, "error", f"No se pudo conectar con el dispatcher: {e}")
         except Exception as e:
             self._log(None, "error", f"Refresh error: {e}")
 
