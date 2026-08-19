@@ -411,13 +411,14 @@ _TRAY_TASK_NAME       = "AtanaTrayWatchdog"
 _TRAY_HEARTBEAT_STALE_MIN = 4  # tray posts a heartbeat every 30s — 4 min is well past any hiccup
 
 
-def _ensure_tray_supervised():
+def _register_tray_task() -> bool:
     """
-    Registers (idempotently) the Scheduled Task that supervises the tray icon
-    and makes sure one instance is running right now.
-    Called once at every dispatcher startup — covers first boot, post-update
-    (including auto-update, which replaces only the .exe, not the installer's
-    [Run]/[Registry] steps) and a tray that died earlier in the session.
+    Registers (idempotently — Register-ScheduledTask -Force just overwrites
+    the same definition) the Scheduled Task that supervises the tray icon.
+    No DB connection needed, safe to call standalone — this is what
+    `atana_dispatcher.exe --register-tray-task` runs (the installer's [Run]
+    step calls that flag instead of shelling out to a raw .ps1 script; see
+    the old installer/register_tray_task.ps1, removed in favor of this).
 
     Why a Scheduled Task instead of the old WMI-polling approach:
       - "At log on" fires for whichever user logs in — Windows itself crosses
@@ -434,23 +435,12 @@ def _ensure_tray_supervised():
         cause of "the tray dies and won't come back" whenever it had been
         (re)launched through this fallback path instead of the old HKCU\\Run
         key.
-
-    In interactive/dev mode (not running as a Windows service) there's no
-    session boundary to cross, so we just launch it directly.
     """
     if os.name != "nt" or not getattr(sys, "frozen", False):
-        return
-
-    if not _running_as_service():
-        _start_tray()
-        return
+        return False
 
     exe_path = str(Path(sys.executable).resolve())
 
-    # NOTE: kept in sync with installer/register_tray_task.ps1 (used by the
-    # installer's [Run] step) — this inline copy exists so clients that get
-    # this dispatcher version via auto-update (.exe swap only, no installer
-    # run) also end up with the task registered/repaired.
     ps = f"""
 $ErrorActionPreference = 'SilentlyContinue'
 Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'AtanaTray'
@@ -459,7 +449,7 @@ Unregister-ScheduledTask -TaskName 'AtanaTrayStart' -Confirm:$false
 $ErrorActionPreference = 'Stop'
 $action    = New-ScheduledTaskAction -Execute '{exe_path}' -Argument '--tray'
 $logon     = New-ScheduledTaskTrigger -AtLogOn
-$watchdog  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration ([TimeSpan]::MaxValue)
+$watchdog  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650)
 $principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Limited
 $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
@@ -474,10 +464,33 @@ Write-Host 'Tray watchdog task registered and started'
         )
         if result.returncode == 0:
             logger.info(f"[tray] {result.stdout.strip()}")
-        else:
-            logger.warning(f"[tray] Task Scheduler setup failed (rc={result.returncode}): {result.stderr.strip()}")
+            return True
+        logger.warning(f"[tray] Task Scheduler setup failed (rc={result.returncode}): {result.stderr.strip()}")
+        return False
     except Exception as e:
         logger.warning(f"[tray] Could not register tray watchdog task: {e}")
+        return False
+
+
+def _ensure_tray_supervised():
+    """
+    Registers/repairs the tray watchdog Scheduled Task and makes sure one
+    instance is running right now. Called once at every dispatcher startup —
+    covers first boot, post-update (including auto-update, which replaces
+    only the .exe, not the installer's [Run] steps) and a tray that died
+    earlier in the session.
+
+    In interactive/dev mode (not running as a Windows service) there's no
+    session boundary to cross, so we just launch it directly instead.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+
+    if not _running_as_service():
+        _start_tray()
+        return
+
+    _register_tray_task()
 
 
 def _tray_watchdog_check():
@@ -762,6 +775,11 @@ def _parse_args():
         action="store_true",
         help="Run the initial database setup wizard",
     )
+    parser.add_argument(
+        "--register-tray-task",
+        action="store_true",
+        help="Register/repair the tray watchdog Scheduled Task and exit (used by the installer)",
+    )
     return parser.parse_args()
 
 
@@ -769,6 +787,13 @@ def main():
     global _config
 
     args = _parse_args()
+
+    # --register-tray-task: register/repair the Scheduled Task and exit. No DB
+    # connection needed — this is what the installer's [Run] step calls
+    # instead of shelling out to a standalone .ps1 script.
+    if args.register_tray_task:
+        ok = _register_tray_task()
+        sys.exit(0 if ok else 1)
 
     # --setup-db: run initial database setup wizard and exit
     if args.setup_db:

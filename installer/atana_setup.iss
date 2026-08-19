@@ -58,11 +58,9 @@ Source: "..\dist\exe\atana_panel.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; NSSM service wrapper — committed to installer/
 Source: "nssm.exe"; DestDir: "{app}"; Flags: ignoreversion
 
-; Registers the Scheduled Task that supervises the tray icon (see [Run] below)
-Source: "register_tray_task.ps1"; DestDir: "{app}"; Flags: ignoreversion
-
-; Reinicia el tray a mano (soporte) sin esperar al watchdog ni reinstalar
-Source: "restart_tray.ps1"; DestDir: "{app}"; Flags: ignoreversion
+; Reinicia el tray a mano (soporte) sin esperar al watchdog ni reinstalar —
+; exe de consola, built by tools/build_restart_tray.py into dist/exe/
+Source: "..\dist\exe\atana_restart_tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Default config — copied only if config.json does not exist yet
 Source: "..\config.example.json"; DestDir: "{app}"; DestName: "config.json"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -76,10 +74,8 @@ Name: "{app}\logs"; Permissions: users-modify
 Name: "{group}\ATANA Panel"; Filename: "{app}\atana_panel.exe"
 Name: "{autodesktop}\ATANA Panel"; Filename: "{app}\atana_panel.exe"; Tasks: desktopicon
 
-; Reiniciar tray — utilidad de soporte, ver installer/restart_tray.ps1
-Name: "{group}\ATANA - Reiniciar Tray"; Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\restart_tray.ps1"""; \
-    WorkingDir: "{app}"; IconFilename: "{app}\atana_dispatcher.exe"
+; Reiniciar tray — utilidad de soporte, ver tools/restart_tray.py
+Name: "{group}\ATANA - Reiniciar Tray"; Filename: "{app}\atana_restart_tray.exe"; WorkingDir: "{app}"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crear acceso directo al Panel en el Escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked
@@ -117,12 +113,19 @@ Filename: "{app}\nssm.exe"; Parameters: "start {#MyServiceName}"; Flags: runhidd
 Filename: "reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v AtanaTray /f"; Flags: runhidden; Check: IsServiceInstalled
 
 ; --- SIEMPRE: registrar (o reparar) la Scheduled Task que supervisa el tray — arranca "at logon" y
-;     se re-dispara cada 3 min si el tray murio (ver installer/register_tray_task.ps1) ---
-Filename: "powershell.exe"; Parameters: "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\register_tray_task.ps1"" -ExePath ""{app}\{#MyAppExeName}"""; Flags: runhidden waituntilterminated
+;     se re-dispara cada 3 min si el tray murio (ver dispatcher/main.py _register_tray_task) ---
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--register-tray-task"; Flags: runhidden waituntilterminated
 
 ; --- SIEMPRE: lanzar tray ahora mismo (la Scheduled Task recien registrada no dispara "at logon"
 ;     retroactivamente para la sesion ya activa; en upgrade reemplaza el viejo) ---
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; Flags: nowait
+
+; --- SIEMPRE: checkbox en la pantalla final del wizard — Flags: postinstall lo agrega ahi solo.
+;     skipifsilent = no aparece en instalaciones desatendidas. --config abre directo en la
+;     pestaña Configuración (ver ui/panel_main.py) para sembrar credenciales de agentes al toque. ---
+Filename: "{app}\atana_panel.exe"; Parameters: "--config"; \
+    Description: "Abrir el Panel de Configuración de ATANA"; \
+    Flags: postinstall skipifsilent nowait
 
 [UninstallRun]
 ; 1. Detener el servicio

@@ -50,6 +50,9 @@ jobs:
       - name: Build panel
         run: python tools/build_panel.py
 
+      - name: Build restart-tray tool
+        run: python tools/build_restart_tray.py
+
       - name: Get NSSM
         shell: pwsh
         run: |
@@ -95,6 +98,7 @@ jobs:
           files: |
             dist/exe/atana_dispatcher.exe
             dist/exe/atana_panel.exe
+            dist/exe/atana_restart_tray.exe
             dist/exe/build_info.json
             installer/Output/AtanaAgents_Setup_v*.exe
         env:

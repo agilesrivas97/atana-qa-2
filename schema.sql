@@ -267,11 +267,14 @@ CREATE USER atana_svc FOR LOGIN atana_svc;
 GO
 
 -- Permisos del servicio: escritura sobre tablas operativas
--- agent_config: solo lectura — el servicio no debe modificar su propia configuración
+-- agent_config: INSERT/UPDATE habilitado (v3.x) — el servicio ahora escribe su
+-- propia configuración, pero SOLO a través de la API interna autenticada
+-- (PUT /config/agents/*, ver dispatcher/api.py — nunca acceso SQL directo sin
+-- pasar por ahí). Antes era de solo lectura.
 GRANT SELECT, INSERT, UPDATE ON agent_jobs              TO atana_svc;
 GRANT SELECT, INSERT, UPDATE ON downloaded_files        TO atana_svc;
 GRANT SELECT, INSERT, UPDATE ON agent_status            TO atana_svc;
-GRANT SELECT             ON agent_config            TO atana_svc;
+GRANT SELECT, INSERT, UPDATE ON agent_config            TO atana_svc;
 GRANT SELECT, INSERT, UPDATE ON system_config           TO atana_svc;
 GRANT SELECT, INSERT, UPDATE ON session_store           TO atana_svc;
 GRANT SELECT, INSERT, UPDATE ON orchestrator_agent_jobs TO atana_svc;
@@ -309,10 +312,20 @@ IF NOT EXISTS (
     WHERE Name = N'period_from' AND Object_ID = Object_ID(N'agent_jobs')
 )
 BEGIN
-    ALTER TABLE agent_jobs ADD 
+    ALTER TABLE agent_jobs ADD
         period_from        DATETIME     NULL,
         period_to        DATETIME     NULL,
         files_downloaded    INT          NOT NULL DEFAULT 0;
+END
+GO
+
+-- 2. Ampliar permisos de atana_svc en agent_config: SELECT -> SELECT/INSERT/UPDATE (v3.x)
+-- Necesario para que el Panel pueda guardar configuración de agentes a través
+-- de la API interna. No-op si el login no existe (instalaciones con
+-- Autenticación Windows en vez de atana_svc) o si ya se aplicó.
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'atana_svc')
+BEGIN
+    GRANT INSERT, UPDATE ON agent_config TO atana_svc;
 END
 GO
 -- ============================================================

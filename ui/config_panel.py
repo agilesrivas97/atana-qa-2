@@ -4,11 +4,20 @@ ui/config_panel.py
 "Configuración" tab: system-wide settings (General / SMTP / Auto-update) plus
 one tab per agent, generated dynamically from GET /config/agents.
 
-Everything here goes through shared/api_client.py — the panel never sees a
-decrypted secret. Every secret field only ever shows "configurado / no
-configurado" plus a "🔄 Reemplazar" button; the plaintext the user types
-into that dialog is sent straight to the API, which encrypts it server-side
-(dispatcher/db.py) before it ever touches the database.
+Everything here goes through shared/api_client.py — the panel never keeps a
+decrypted secret around. Every secret field shows "configurado / no
+configurado" plus a "🔄 Reemplazar" button; the dialog pre-fills the CURRENT
+value (fetched on demand, plaintext, over the same authenticated local API —
+see GET /config/agents/{provider}/secret/{field} in dispatcher/api.py) so the
+user can see and edit it instead of typing blind. The value the user ends up
+with is sent back and encrypted server-side (dispatcher/db.py) before it ever
+touches the database.
+
+Saving: a single "💾 Guardar todo" button lives in ConfigTab, above the
+sub-tabs, and saves every tab's plain fields in one shot — no per-tab save
+button. Secrets (Reemplazar) and MercadoPago-style accounts still save
+immediately on their own action, since those are one-off operations, not
+form state.
 """
 
 import tkinter as tk
@@ -33,13 +42,14 @@ _AGENT_TOP_LEVEL_FIELDS = [
     ("max_retries",        "Reintentos máximos",         "int"),
     ("retry_interval_min", "Minutos entre reintentos",   "int"),
 ]
-_AGENT_TOP_LEVEL_KEYS = {k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS} | {"provider", "has_password"}
+_AGENT_TOP_LEVEL_KEYS = {k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS} | {"provider", "has_password", "available"}
 
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
 
 def _ask_secret(parent, title: str, prompt: str, initial: str = "") -> str | None:
-    """Modal dialog with a masked Entry. Returns the typed value, or None if cancelled."""
+    """Modal dialog with a masked (togglable) Entry, pre-fillable with the
+    current value. Returns the typed value, or None if cancelled."""
     result = {"value": None}
 
     win = tk.Toplevel(parent)
@@ -54,6 +64,7 @@ def _ask_secret(parent, title: str, prompt: str, initial: str = "") -> str | Non
     entry = tk.Entry(win, textvariable=var, show="•", width=44, font=_FIELD_FONT)
     entry.pack(padx=16, pady=4)
     entry.focus_set()
+    entry.icursor("end")
 
     show_var = tk.BooleanVar(value=False)
     tk.Checkbutton(
@@ -86,13 +97,14 @@ def _confirm(parent, title: str, message: str) -> bool:
 
 class _SettingsTabBase(ttk.Frame):
     """Common scaffolding for a settings form: a grid of labeled fields plus
-    a bottom bar with a single 'Guardar cambios' button."""
+    a small status label (no button — saving is global, see ConfigTab)."""
 
     def __init__(self, parent, api: ApiClient, title: str):
         super().__init__(parent)
         self.api = api
         self._vars: dict[str, tk.Variable] = {}
         self._row = 0
+        self._save_status: tk.Label | None = None
 
         tk.Label(self, text=title, font=("Segoe UI", 13, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 8),
@@ -158,23 +170,25 @@ class _SettingsTabBase(ttk.Frame):
             body[key] = raw if raw != "" else None
         return body
 
-    def _save_bar(self, on_save):
+    def _status_row(self):
+        """Small inline feedback label — no button. Saving itself happens via
+        ConfigTab's single global 'Guardar todo'."""
         row = self._row + 1
-        bar = tk.Frame(self, pady=12)
-        bar.grid(row=row, column=0, columnspan=3, sticky="w", padx=16)
-        tk.Button(
-            bar, text="💾 Guardar cambios", bg="#1971c2", fg="white",
-            relief="flat", cursor="hand2", padx=14, pady=6, command=on_save,
-        ).pack(side="left")
-        self._save_status = tk.Label(bar, text="", font=("Segoe UI", 9), fg="#2f9e44")
-        self._save_status.pack(side="left", padx=10)
+        self._save_status = tk.Label(self, text="", font=("Segoe UI", 9))
+        self._save_status.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 12))
 
     def _flash_saved(self, ok: bool, detail: str = ""):
+        if self._save_status is None:
+            return
         if ok:
             self._save_status.config(text="Guardado ✔", fg="#2f9e44")
         else:
             self._save_status.config(text=f"Error: {detail}", fg="#e03131")
         self.after(4000, lambda: self._save_status.config(text=""))
+
+    def save(self) -> bool:
+        """Overridden by subclasses. Returns True on success."""
+        return True
 
 
 # ── General ──────────────────────────────────────────────────────────────
@@ -199,21 +213,58 @@ class GeneralSettingsTab(_SettingsTabBase):
         self._add_field("api_port",                    "Puerto de la API interna",             "str", sys_cfg.get("api_port", 8765))
         self._add_field("debug",                        "Logs en modo debug",                  "bool", str(sys_cfg.get("debug", "")).lower() == "true")
 
-        self._save_bar(self._save)
+        self._status_row()
+        self._build_operation_section()
         self._build_security_section()
 
-    def _save(self):
+    def save(self) -> bool:
         body = self._collect_plain(list(self._INT_FIELDS))
         body["debug"] = "true" if self._vars["debug"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
         try:
             self.api.put("/config/system", body)
             self._flash_saved(True)
+            return True
         except ApiError as e:
             self._flash_saved(False, str(e))
+            return False
+
+    def _build_operation_section(self):
+        row = self._row + 2
+        op = tk.LabelFrame(self, text="Operación", font=_LABEL_FONT, padx=12, pady=12)
+        op.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 0))
+        self._row = row + 1
+
+        tk.Label(
+            op, text="Reinicia el proceso del dispatcher (servicio Windows). Se recupera solo\n"
+                      "en ~15s — cualquier job a mitad de camino se retoma en el próximo ciclo.",
+            font=("Segoe UI", 9), fg="#666666", justify="left",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        tk.Button(
+            op, text="🔄 Reiniciar servicio", relief="flat", cursor="hand2",
+            padx=10, pady=4, command=self._restart_service,
+        ).grid(row=1, column=0, sticky="w")
+
+        self._op_status = tk.Label(op, text="", font=("Segoe UI", 9))
+        self._op_status.grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+    def _restart_service(self):
+        if not _confirm(
+            self, "Reiniciar servicio",
+            "Esto reinicia el proceso del dispatcher (AtanaDispatcher). Los agentes en curso se "
+            "interrumpen y se retoman solos en el próximo ciclo — no se pierde nada, pero puede "
+            "tardar unos segundos en volver a responder.\n\n¿Continuar?",
+        ):
+            return
+        try:
+            self.api.post("/service/restart")
+            self._op_status.config(text="Reiniciando... puede tardar ~15-20s en volver.", fg="#1971c2")
+        except ApiError as e:
+            self._op_status.config(text=f"Error: {e}", fg="#e03131")
 
     def _build_security_section(self):
-        row = self._row + 2
+        row = self._row + 1
         sec = tk.LabelFrame(self, text="Seguridad", font=_LABEL_FONT, padx=12, pady=12)
         sec.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=16)
 
@@ -308,20 +359,26 @@ class SmtpSettingsTab(_SettingsTabBase):
             on_replace=self._replace_password,
         )
 
-        self._save_bar(self._save)
+        self._status_row()
 
-    def _save(self):
+    def save(self) -> bool:
         body = self._collect_plain(["smtp_host", "smtp_port", "smtp_username", "smtp_recipient"])
         body["smtp_enabled"] = "true" if self._vars["smtp_enabled"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
         try:
             self.api.put("/config/system", body)
             self._flash_saved(True)
+            return True
         except ApiError as e:
             self._flash_saved(False, str(e))
+            return False
 
     def _replace_password(self):
-        value = _ask_secret(self, "Contraseña SMTP", "Nueva contraseña:")
+        try:
+            current = self.api.get("/config/system/secret/smtp_password").get("value", "")
+        except ApiError:
+            current = ""
+        value = _ask_secret(self, "Contraseña SMTP", "Contraseña:", initial=current)
         if value is None:
             return
         try:
@@ -360,19 +417,25 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
         ).grid(row=self._row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
         self._row += 1
 
-        self._save_bar(self._save)
+        self._status_row()
 
-    def _save(self):
+    def save(self) -> bool:
         body = self._collect_plain(["github_owner", "github_repo"])
         body = {k: v for k, v in body.items() if v is not None}
         try:
             self.api.put("/config/system", body)
             self._flash_saved(True)
+            return True
         except ApiError as e:
             self._flash_saved(False, str(e))
+            return False
 
     def _replace_token(self):
-        value = _ask_secret(self, "GitHub Token", "Nuevo Personal Access Token:")
+        try:
+            current = self.api.get("/config/system/secret/github_token").get("value", "")
+        except ApiError:
+            current = ""
+        value = _ask_secret(self, "GitHub Token", "Personal Access Token:", initial=current)
         if value is None:
             return
         try:
@@ -427,9 +490,9 @@ class AgentConfigTab(_SettingsTabBase):
                 self._extra_plain_keys.append(key)
                 self._add_field(key, key.replace("_", " ").capitalize(), "str", value)
 
-        self._save_bar(self._save)
+        self._status_row()
 
-    def _save(self):
+    def save(self) -> bool:
         body = self._collect_plain(
             [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"] + self._extra_plain_keys
         )
@@ -439,23 +502,33 @@ class AgentConfigTab(_SettingsTabBase):
                 try:
                     body[k] = int(body[k])
                 except ValueError:
-                    messagebox.showerror("ATANA", f"'{k}' debe ser un número.", parent=self)
-                    return
+                    messagebox.showerror("ATANA", f"[{self.provider.upper()}] '{k}' debe ser un número.", parent=self)
+                    return False
         body = {k: v for k, v in body.items() if v is not None}
         try:
             self.api.put(f"/config/agents/{self.provider}", body)
             self._flash_saved(True)
+            return True
         except ApiError as e:
             self._flash_saved(False, str(e))
+            return False
 
     def _replace_password(self):
-        value = _ask_secret(self, f"Contraseña — {self.provider.upper()}", "Nueva contraseña del portal:")
+        try:
+            current = self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", "")
+        except ApiError:
+            current = ""
+        value = _ask_secret(self, f"Contraseña — {self.provider.upper()}", "Usuario y contraseña del portal:", initial=current)
         if value is None:
             return
         self._put_secret({"password": value})
 
     def _replace_extra_secret(self, logical_key: str):
-        value = _ask_secret(self, f"{logical_key} — {self.provider.upper()}", f"Nuevo valor para '{logical_key}':")
+        try:
+            current = self.api.get(f"/config/agents/{self.provider}/secret/{logical_key}").get("value", "")
+        except ApiError:
+            current = ""
+        value = _ask_secret(self, f"{logical_key} — {self.provider.upper()}", f"Valor de '{logical_key}':", initial=current)
         if value is None:
             return
         self._put_secret({logical_key: value})
@@ -502,7 +575,8 @@ class AgentConfigTab(_SettingsTabBase):
             return
         self._put_secret({logical_key: secret})
 
-    # ── accounts (e.g. mercadopago) ─────────────────────────────────────
+    # ── accounts (MercadoPago y cualquier agente con múltiples cuentas) ──
+    # Sin límite de cantidad — "+ Agregar cuenta" siempre agrega una más.
 
     def _build_accounts_section(self):
         row = self._row
@@ -577,7 +651,11 @@ class AgentConfigTab(_SettingsTabBase):
         tk.Button(btns, text="Cancelar", command=win.destroy, relief="flat", padx=12).pack(side="left")
 
     def _replace_account_token(self, alias: str):
-        value = _ask_secret(self, f"Token — {alias}", f"Nuevo access token para '{alias}':")
+        try:
+            current = self.api.get(f"/config/agents/{self.provider}/secret/accounts/{alias}").get("value", "")
+        except ApiError:
+            current = ""
+        value = _ask_secret(self, f"Token — {alias}", f"Access token de '{alias}':", initial=current)
         if value is None:
             return
         self._save_accounts(extra_token={alias: value})
@@ -609,6 +687,30 @@ class AgentConfigTab(_SettingsTabBase):
             messagebox.showerror("ATANA", f"No se pudo guardar la cuenta: {e}", parent=self)
 
 
+# ── Agentes aún no disponibles ───────────────────────────────────────────
+
+class _UnavailableAgentTab(ttk.Frame):
+    """
+    Placeholder para providers que ya tienen fila en agent_config (seed_config.sql)
+    pero todavía no tienen bot implementado (agent_loader.known_providers() no
+    los incluye) — naranjax, getnet, cabal, amex, prisma al momento de escribir esto.
+    """
+
+    def __init__(self, parent, provider: str):
+        super().__init__(parent)
+        wrap = tk.Frame(self)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+
+        tk.Label(wrap, text=provider.upper(), font=("Segoe UI", 14, "bold"), fg="#999999").pack()
+        tk.Label(
+            wrap, text="Este agente todavía no está disponible.",
+            font=_FIELD_FONT, fg="#666666",
+        ).pack(pady=(6, 0))
+
+    def save(self) -> bool:
+        return True  # nada que guardar
+
+
 # ── Orchestrator tab ─────────────────────────────────────────────────────
 
 class ConfigTab(ttk.Frame):
@@ -616,13 +718,31 @@ class ConfigTab(ttk.Frame):
     def __init__(self, parent, api: ApiClient):
         super().__init__(parent)
         self.api = api
+        self._savable_tabs: list = []
+
+        header = tk.Frame(self, bg="#f0f0f0", pady=8, padx=16)
+        header.pack(fill="x", side="top")
+
+        tk.Button(
+            header, text="💾 Guardar todo", bg="#1971c2", fg="white",
+            relief="flat", cursor="hand2", padx=16, pady=6,
+            command=self._save_all,
+        ).pack(side="left")
+
+        self._global_status = tk.Label(header, text="", font=("Segoe UI", 9), bg="#f0f0f0")
+        self._global_status.pack(side="left", padx=12)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        self.notebook.add(GeneralSettingsTab(self.notebook, api),    text="General")
-        self.notebook.add(SmtpSettingsTab(self.notebook, api),       text="SMTP")
-        self.notebook.add(AutoUpdateSettingsTab(self.notebook, api), text="Auto-update")
+        core_tabs = [
+            (GeneralSettingsTab(self.notebook, api),    "General"),
+            (SmtpSettingsTab(self.notebook, api),       "SMTP"),
+            (AutoUpdateSettingsTab(self.notebook, api), "Auto-update"),
+        ]
+        for tab, label in core_tabs:
+            self.notebook.add(tab, text=label)
+            self._savable_tabs.append(tab)
 
         self._load_agent_tabs()
 
@@ -636,5 +756,33 @@ class ConfigTab(ttk.Frame):
 
         for agent in sorted(agents, key=lambda a: a.get("provider", "")):
             provider = agent["provider"]
-            tab = AgentConfigTab(self.notebook, self.api, provider, agent)
+            if agent.get("available", True):
+                tab = AgentConfigTab(self.notebook, self.api, provider, agent)
+                self._savable_tabs.append(tab)
+            else:
+                tab = _UnavailableAgentTab(self.notebook, provider)
             self.notebook.add(tab, text=provider.capitalize())
+
+    def _save_all(self):
+        self._global_status.config(text="Guardando...", fg="#1971c2")
+        self.update_idletasks()
+
+        ok_count = 0
+        failed: list[str] = []
+        for tab in self._savable_tabs:
+            title = getattr(tab, "provider", type(tab).__name__.replace("SettingsTab", ""))
+            try:
+                if tab.save():
+                    ok_count += 1
+                else:
+                    failed.append(str(title))
+            except Exception as e:
+                failed.append(f"{title} ({e})")
+
+        if failed:
+            self._global_status.config(
+                text=f"{ok_count} guardado(s), falló: {', '.join(failed)}", fg="#e03131",
+            )
+        else:
+            self._global_status.config(text=f"Todo guardado ✔ ({ok_count})", fg="#2f9e44")
+        self.after(6000, lambda: self._global_status.config(text=""))

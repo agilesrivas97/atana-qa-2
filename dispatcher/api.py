@@ -7,6 +7,7 @@ Protected with optional API key.
 """
 
 import json
+import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -149,13 +150,35 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
             return
 
+        # GET /config/system/secret/{field} — decrypted value of a secret
+        # system_config key (smtp_password, github_token). Same tradeoff as the
+        # per-agent secret endpoint below: only exists to pre-fill "Reemplazar".
+        if len(parts) == 4 and parts[0] == "config" and parts[1] == "system" and parts[2] == "secret":
+            if not self._auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            field = parts[3]
+            try:
+                value = db.get_system_secret(field)
+                logger.warning(f"[system] Plaintext read of secret field '{field}' via API")
+                self._json(200, {"field": field, "value": value})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
         # GET /config/agents — masked config for every agent
         if len(parts) == 2 and parts[0] == "config" and parts[1] == "agents":
             if not self._auth():
                 self._json(401, {"error": "unauthorized"})
                 return
             try:
-                self._json(200, {"agents": db.get_all_agent_configs_masked()})
+                known  = set(_known_providers())
+                agents = db.get_all_agent_configs_masked()
+                for a in agents:
+                    a["available"] = a["provider"] in known
+                self._json(200, {"agents": agents})
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
@@ -171,7 +194,53 @@ class _Handler(BaseHTTPRequestHandler):
                 if cfg is None:
                     self._json(404, {"error": f"Unknown provider: {provider}"})
                 else:
+                    cfg["available"] = provider in _known_providers()
                     self._json(200, cfg)
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
+        # GET /config/agents/{provider}/secret/{field} — the DECRYPTED value of a
+        # single top-level or extra_config secret field (e.g. 'password',
+        # 'totp_secret'). Used only to pre-fill the "Reemplazar" dialog in the
+        # panel so the user can see/edit the current value instead of typing
+        # blind. Logged — this is the one path that returns plaintext secrets
+        # over the API, by explicit design request.
+        if len(parts) == 5 and parts[0] == "config" and parts[1] == "agents" and parts[3] == "secret":
+            if not self._auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            provider, field = parts[2], parts[4]
+            try:
+                cfg = db.get_agent_config(provider)
+                if cfg is None:
+                    self._json(404, {"error": f"Unknown provider: {provider}"})
+                    return
+                logger.warning(f"[{provider}] Plaintext read of secret field '{field}' via API")
+                self._json(200, {"field": field, "value": cfg.get(field, "") or ""})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
+        # GET /config/agents/{provider}/secret/accounts/{alias} — same, for one
+        # MercadoPago-style account's access_token.
+        if (len(parts) == 6 and parts[0] == "config" and parts[1] == "agents"
+                and parts[3] == "secret" and parts[4] == "accounts"):
+            if not self._auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            provider, alias = parts[2], parts[5]
+            try:
+                cfg = db.get_agent_config(provider)
+                if cfg is None:
+                    self._json(404, {"error": f"Unknown provider: {provider}"})
+                    return
+                acc = next((a for a in cfg.get("accounts", []) if a.get("alias") == alias), None)
+                if acc is None:
+                    self._json(404, {"error": f"Unknown alias: {alias}"})
+                    return
+                logger.warning(f"[{provider}] Plaintext read of account '{alias}' token via API")
+                self._json(200, {"alias": alias, "value": acc.get("access_token", "") or ""})
             except Exception as e:
                 self._json(500, {"error": str(e)})
             return
@@ -349,6 +418,21 @@ class _Handler(BaseHTTPRequestHandler):
             ).start()
             logger.info(f"[rotate] Master key rotation started — targets: {sorted(targets)}")
             self._json(202, {"status": "started", "targets": sorted(targets)})
+            return
+
+        # POST /service/restart — exits the process; NSSM's AppRestartDelay (15s, set by the
+        # installer) brings it back up automatically. Stuck jobs left 'running' are reset to
+        # 'pending' at the next startup (see main.py), so this is safe mid-job too.
+        if len(parts) == 2 and parts[0] == "service" and parts[1] == "restart":
+            logger.warning("[service] Restart requested via API — exiting so NSSM relaunches it")
+            self._json(202, {"status": "restarting"})
+
+            def _delayed_exit():
+                import time
+                time.sleep(1)  # let the HTTP response above actually flush to the client
+                os._exit(0)
+
+            threading.Thread(target=_delayed_exit, daemon=True, name="service-restart").start()
             return
 
         self._json(404, {"error": "not found"})

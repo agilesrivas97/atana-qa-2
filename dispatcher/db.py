@@ -486,6 +486,25 @@ def get_system_config_masked() -> dict:
     return result
 
 
+def get_system_secret(key: str) -> str:
+    """
+    Returns the DECRYPTED value of a single secret system_config key (must be
+    in _SYSTEM_SECRET_KEYS — e.g. 'smtp_password', 'github_token'). Used only
+    to pre-fill the panel's 'Reemplazar' dialog with the current value instead
+    of an empty field. The caller (dispatcher/api.py) logs every use.
+    """
+    if key not in _SYSTEM_SECRET_KEYS:
+        raise ValueError(f"'{key}' is not a recognized secret system_config key")
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value_config FROM system_config WHERE key_config = ?", f"{key}_enc"
+        ).fetchone()
+    if not row or not row[0]:
+        return ""
+    raw = row[0].encode() if isinstance(row[0], str) else row[0]
+    return _decrypt(raw)
+
+
 def update_system_config(fields: dict) -> None:
     """
     Bulk-updates system_config from plaintext logical keys (e.g. 'smtp_password',
