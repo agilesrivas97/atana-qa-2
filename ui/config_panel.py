@@ -26,13 +26,23 @@ Saving: a single "💾 Guardar todo" button lives bottom-right of ConfigTab and
 saves every tab's fields — plain and secret alike — in one shot. MercadoPago
 -style accounts still save immediately per-row (add/remove/token), since
 each is a one-off list operation, not form state.
+
+'Guardar todo' itself is two-phase to keep the window responsive: each tab's
+_build_save_job() reads its Tk vars and returns a plain {endpoint, body} dict
+— fast, main-thread only, since Tk variables aren't safe to touch off-thread.
+ConfigTab then fires all the PUTs in a single background thread (via
+ui.async_utils.run_async) and only touches widgets again once every request
+is back. Doing the PUTs inline on the main thread (the original approach)
+blocked the Tk event loop for the whole batch — several agents' worth of
+sequential HTTP round-trips — which is what caused the window to stop
+repainting and show stale/garbled text while "Guardando..." was up.
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from shared.api_client import ApiClient, ApiError
-from ui.async_utils import run_async_retrying
+from ui.async_utils import run_async, run_async_retrying
 
 _FIELD_FONT = ("Segoe UI", 10)
 _LABEL_FONT = ("Segoe UI", 10, "bold")
@@ -53,6 +63,11 @@ _AGENT_TOP_LEVEL_KEYS = (
     {k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS}
     | {"provider", "has_password", "available", "username"}
 )
+
+# Agents that authenticate purely via per-account access tokens (MercadoPago's
+# REST API, one token per alias/cuenta) instead of a single username/password —
+# CREDENCIALES shows only the Cuentas editor for these, no Usuario/Contraseña.
+_PROVIDERS_WITHOUT_LOGIN = {"mercadopago"}
 
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
@@ -217,11 +232,16 @@ class _SettingsTabBase(ttk.Frame):
             self._save_status.config(text=f"Error: {detail}", fg="#e03131")
         self.after(4000, lambda: self._save_status.config(text=""))
 
-    def save(self) -> bool:
-        """Overridden by subclasses. Returns True on success. A tab that
-        hasn't finished loading yet (still showing 'Cargando...') has
-        nothing to save — no-op."""
-        return True
+    def _build_save_job(self) -> dict | None:
+        """
+        Overridden by subclasses. Reads this tab's Tk vars (main-thread only —
+        Tk variables aren't safe to touch off-thread) and returns
+        {'tab': self, 'endpoint': ..., 'body': ...} for ConfigTab to PUT from
+        a background thread — no network I/O happens here. Returns None if
+        there's nothing to save (tab hasn't finished loading yet) or if
+        client-side validation failed (already reported via messagebox).
+        """
+        return None
 
 
 # ── General ──────────────────────────────────────────────────────────────
@@ -246,19 +266,13 @@ class GeneralSettingsTab(_SettingsTabBase):
         self._build_security_section()
         self._loaded = True
 
-    def save(self) -> bool:
+    def _build_save_job(self) -> dict | None:
         if not self._loaded:
-            return True
+            return None
         body = self._collect_plain(list(self._INT_FIELDS))
         body["debug"] = "true" if self._vars["debug"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
-        try:
-            self.api.put("/config/system", body)
-            self._flash_saved(True)
-            return True
-        except ApiError as e:
-            self._flash_saved(False, str(e))
-            return False
+        return {"tab": self, "endpoint": "/config/system", "body": body}
 
     def _build_operation_section(self):
         row = self._row + 2
@@ -391,19 +405,13 @@ class SmtpSettingsTab(_SettingsTabBase):
         self._status_row()
         self._loaded = True
 
-    def save(self) -> bool:
+    def _build_save_job(self) -> dict | None:
         if not self._loaded:
-            return True
+            return None
         body = self._collect_plain(["smtp_host", "smtp_port", "smtp_username", "smtp_recipient", "smtp_password"])
         body["smtp_enabled"] = "true" if self._vars["smtp_enabled"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
-        try:
-            self.api.put("/config/system", body)
-            self._flash_saved(True)
-            return True
-        except ApiError as e:
-            self._flash_saved(False, str(e))
-            return False
+        return {"tab": self, "endpoint": "/config/system", "body": body}
 
 
 # ── Auto-update ──────────────────────────────────────────────────────────
@@ -436,18 +444,12 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
         self._status_row()
         self._loaded = True
 
-    def save(self) -> bool:
+    def _build_save_job(self) -> dict | None:
         if not self._loaded:
-            return True
+            return None
         body = self._collect_plain(["github_owner", "github_repo", "github_token"])
         body = {k: v for k, v in body.items() if v is not None}
-        try:
-            self.api.put("/config/system", body)
-            self._flash_saved(True)
-            return True
-        except ApiError as e:
-            self._flash_saved(False, str(e))
-            return False
+        return {"tab": self, "endpoint": "/config/system", "body": body}
 
 
 # ── Per-agent ────────────────────────────────────────────────────────────
@@ -476,21 +478,26 @@ class AgentConfigTab(_SettingsTabBase):
         self._build(agent)
 
     def _build(self, agent: dict):
+        has_login = self.provider not in _PROVIDERS_WITHOUT_LOGIN
+
         # ── CREDENCIALES ──────────────────────────────────────────────────
         self._start_group("CREDENCIALES")
 
-        self._add_field("username", "Usuario", "str", agent.get("username"))
-        self._add_secret_row(
-            "password", "Contraseña / Token",
-            fetch_value=lambda: self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", ""),
-        )
+        if has_login:
+            self._add_field("username", "Usuario", "str", agent.get("username"))
+            self._add_secret_row(
+                "password", "Contraseña / Token",
+                fetch_value=lambda: self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", ""),
+            )
 
+        accounts_built = False
         for key, value in agent.items():
             if key in _AGENT_TOP_LEVEL_KEYS:
                 continue
             if key == "accounts" and isinstance(value, list):
                 self._accounts = value
                 self._build_accounts_section()
+                accounts_built = True
             elif key.endswith("_set"):
                 logical = key[:-4]
                 is_totp = logical == "totp_secret"
@@ -501,6 +508,13 @@ class AgentConfigTab(_SettingsTabBase):
                     fetch_value=lambda k=logical: self.api.get(f"/config/agents/{self.provider}/secret/{k}").get("value", ""),
                     extra=self._qr_button(logical) if is_totp else None,
                 )
+
+        if not has_login and not accounts_built:
+            # Un agente sin login único (MercadoPago) siempre necesita poder
+            # agregar cuentas — incluso antes de tener la primera, cuando
+            # extra_config todavía no trae la clave 'accounts' (por ejemplo
+            # si el seed nunca se completó o quedó vacío).
+            self._build_accounts_section()
 
         self._end_group()
 
@@ -516,7 +530,7 @@ class AgentConfigTab(_SettingsTabBase):
 
         self._status_row()
 
-    def save(self) -> bool:
+    def _build_save_job(self) -> dict | None:
         body = self._collect_plain(
             ["username", "password"]
             + [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"]
@@ -530,15 +544,9 @@ class AgentConfigTab(_SettingsTabBase):
                     body[k] = int(body[k])
                 except ValueError:
                     messagebox.showerror("ATANA", f"[{self.provider.upper()}] '{k}' debe ser un número.", parent=self)
-                    return False
+                    return None
         body = {k: v for k, v in body.items() if v is not None}
-        try:
-            self.api.put(f"/config/agents/{self.provider}", body)
-            self._flash_saved(True)
-            return True
-        except ApiError as e:
-            self._flash_saved(False, str(e))
-            return False
+        return {"tab": self, "endpoint": f"/config/agents/{self.provider}", "body": body}
 
     def _put_secret(self, body: dict):
         try:
@@ -822,20 +830,56 @@ class ConfigTab(ttk.Frame):
             self.notebook.add(tab, text=provider.capitalize())
 
     def _save_all(self):
-        self._global_status.config(text="Guardando...", fg="#1971c2")
-        self.update_idletasks()
+        """
+        Two phases, deliberately split so the window keeps repainting while
+        this runs:
+          1. HERE, on the main thread: each tab's _build_save_job() reads its
+             Tk vars and does client-side validation — fast, no network, and
+             the only place Tk vars are touched (they aren't thread-safe).
+          2. In a background thread: every resulting PUT is sent. Doing this
+             inline on the main thread (the original approach) blocked the Tk
+             event loop for the whole batch and was the actual cause of the
+             window freezing/garbling mid-save.
+        """
+        jobs = []
+        for tab in self._savable_tabs:
+            job = tab._build_save_job()
+            if job is not None:
+                jobs.append(job)
 
+        if not jobs:
+            self._global_status.config(text="Nada para guardar", fg="#999999")
+            self.after(3000, lambda: self._global_status.config(text=""))
+            return
+
+        self._global_status.config(text="Guardando...", fg="#1971c2")
+
+        def _send_all():
+            results = []
+            for job in jobs:
+                try:
+                    self.api.put(job["endpoint"], job["body"])
+                    results.append((job["tab"], True, ""))
+                except Exception as e:
+                    results.append((job["tab"], False, str(e)))
+            return results
+
+        run_async(
+            self, work=_send_all,
+            on_done=self._on_save_all_done,
+            on_error=lambda e: self._global_status.config(text=f"Error: {e}", fg="#e03131"),
+        )
+
+    def _on_save_all_done(self, results: list):
         ok_count = 0
         failed: list[str] = []
-        for tab in self._savable_tabs:
+        for tab, ok, detail in results:
+            tab._flash_saved(ok, detail)
             title = getattr(tab, "provider", type(tab).__name__.replace("SettingsTab", ""))
-            try:
-                if tab.save():
-                    ok_count += 1
-                else:
-                    failed.append(str(title))
-            except Exception as e:
-                failed.append(f"{title} ({e})")
+            if ok:
+                ok_count += 1
+            else:
+                failed.append(f"{title} ({detail})" if detail else str(title))
 
         if failed:
             self._global_status.config(
