@@ -5,14 +5,13 @@ ui/config_panel.py
 one tab per agent, generated dynamically from GET /config/agents.
 
 Everything here goes through shared/api_client.py — NEVER SQL Server
-directly. The panel doesn't keep a decrypted secret around either: every
-secret field shows "configurado / no configurado" plus a "🔄 Reemplazar"
-button; the dialog pre-fills the CURRENT value (fetched on demand, plaintext,
-over the same authenticated local API — see
-GET /config/agents/{provider}/secret/{field} in dispatcher/api.py) so the
-user can see and edit it instead of typing blind. The value the user ends up
-with is sent back and encrypted server-side (dispatcher/db.py) before it ever
-touches the database.
+directly. Every secret field (password, token, TOTP secret, account token)
+is a plain masked Entry pre-filled with the CURRENT decrypted value (fetched
+once, async, right when the tab populates — see
+GET /config/agents/{provider}/secret/{field} in dispatcher/api.py) with a
+"Mostrar" checkbox to reveal it — no separate "Reemplazar" dialog. You see
+it, edit it in place, and it's sent back and encrypted server-side
+(dispatcher/db.py) on save, same as every other field.
 
 Loading: every tab that needs data shows a "Cargando..." placeholder first —
 window and Notebook appear instantly — and gets populated once its
@@ -23,11 +22,10 @@ for General+SMTP+Auto-update (used to be 3 separate round-trips — one per
 tab — which is why this used to feel slow to open), one GET /config/agents
 for every agent tab.
 
-Saving: a single "💾 Guardar todo" button lives in ConfigTab, above the
-sub-tabs, and saves every tab's plain fields in one shot — no per-tab save
-button. Secrets (Reemplazar) and MercadoPago-style accounts still save
-immediately on their own action, since those are one-off operations, not
-form state.
+Saving: a single "💾 Guardar todo" button lives bottom-right of ConfigTab and
+saves every tab's fields — plain and secret alike — in one shot. MercadoPago
+-style accounts still save immediately per-row (add/remove/token), since
+each is a one-off list operation, not form state.
 """
 
 import tkinter as tk
@@ -58,50 +56,6 @@ _AGENT_TOP_LEVEL_KEYS = (
 
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
-
-def _ask_secret(parent, title: str, prompt: str, initial: str = "") -> str | None:
-    """Modal dialog with a masked (togglable) Entry, pre-fillable with the
-    current value. Returns the typed value, or None if cancelled."""
-    result = {"value": None}
-
-    win = tk.Toplevel(parent)
-    win.title(title)
-    win.resizable(False, False)
-    win.transient(parent.winfo_toplevel())
-    win.grab_set()
-
-    tk.Label(win, text=prompt, font=_FIELD_FONT, padx=16, pady=(16, 4)).pack(anchor="w")
-
-    var = tk.StringVar(value=initial)
-    entry = tk.Entry(win, textvariable=var, show="•", width=44, font=_FIELD_FONT)
-    entry.pack(padx=16, pady=4)
-    entry.focus_set()
-    entry.icursor("end")
-
-    show_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
-        win, text="Mostrar", variable=show_var,
-        command=lambda: entry.config(show="" if show_var.get() else "•"),
-    ).pack(anchor="w", padx=16)
-
-    btns = tk.Frame(win, pady=12, padx=16)
-    btns.pack(fill="x")
-
-    def _ok():
-        result["value"] = var.get()
-        win.destroy()
-
-    def _cancel():
-        win.destroy()
-
-    tk.Button(btns, text="Guardar", command=_ok, bg="#1971c2", fg="white", relief="flat", padx=14, pady=4).pack(side="right")
-    tk.Button(btns, text="Cancelar", command=_cancel, relief="flat", padx=14, pady=4).pack(side="right", padx=6)
-
-    win.bind("<Return>", lambda e: _ok())
-    win.bind("<Escape>", lambda e: _cancel())
-    win.wait_window()
-    return result["value"]
-
 
 def _confirm(parent, title: str, message: str) -> bool:
     return messagebox.askyesno(title, message, parent=parent)
@@ -197,22 +151,38 @@ class _SettingsTabBase(ttk.Frame):
         self._row += 1
         return var
 
-    def _add_secret_row(self, key: str, label: str, is_set: bool, on_replace, extra=None):
+    def _add_secret_row(self, key: str, label: str, fetch_value, extra=None):
+        """Inline masked Entry for a password/token/secret — no more 'Reemplazar'
+        dialog. Starts empty and gets pre-filled with the current decrypted
+        value once `fetch_value()` (a GET .../secret/{field} call) resolves,
+        via run_async_retrying so a slow/transient fetch doesn't block the
+        rest of the form from showing. The var lands in self._vars[key], same
+        as any plain field, so _collect_plain(...) picks it up for free —
+        whatever's in the box when 'Guardar todo' runs gets sent back and
+        re-encrypted server-side."""
         row = self._row
         tk.Label(self.form, text=label, font=_FIELD_FONT).grid(row=row, column=0, sticky="w", padx=16, pady=4)
 
-        status = tk.Label(
-            self.form,
-            text="●  configurado" if is_set else "○  no configurado",
-            fg="#2f9e44" if is_set else "#999999", font=_FIELD_FONT,
-        )
-        status.grid(row=row, column=1, sticky="w", padx=4)
+        var = tk.StringVar(value="")
+        entry = tk.Entry(self.form, textvariable=var, show="•", width=38, font=("Consolas", 10))
+        entry.grid(row=row, column=1, sticky="w", padx=4)
+        self._vars[key] = var
 
-        btns = tk.Frame(self.form)
-        btns.grid(row=row, column=2, sticky="w")
-        tk.Button(btns, text="🔄 Reemplazar", relief="flat", cursor="hand2", command=on_replace).pack(side="left")
+        show_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self.form, text="Mostrar", variable=show_var,
+            command=lambda: entry.config(show="" if show_var.get() else "•"),
+        ).grid(row=row, column=2, sticky="w")
+
         if extra:
-            extra(btns)
+            extra_frame = tk.Frame(self.form)
+            extra_frame.grid(row=row, column=3, sticky="w", padx=(6, 0))
+            extra(extra_frame)
+
+        run_async_retrying(
+            self, work=fetch_value, on_done=lambda v: var.set(v or ""),
+            on_final_error=lambda e: None,  # queda vacío — no bloquea el resto del form
+        )
 
         self._row += 1
 
@@ -408,8 +378,8 @@ class SmtpSettingsTab(_SettingsTabBase):
         self._start_group("CREDENCIALES")
         self._add_field("smtp_username", "Usuario / remitente", "str", sys_cfg.get("smtp_username", ""))
         self._add_secret_row(
-            "smtp_password", "Contraseña", bool(sys_cfg.get("smtp_password_set")),
-            on_replace=self._replace_password,
+            "smtp_password", "Contraseña",
+            fetch_value=lambda: self.api.get("/config/system/secret/smtp_password").get("value", ""),
         )
         self._end_group()
 
@@ -424,7 +394,7 @@ class SmtpSettingsTab(_SettingsTabBase):
     def save(self) -> bool:
         if not self._loaded:
             return True
-        body = self._collect_plain(["smtp_host", "smtp_port", "smtp_username", "smtp_recipient"])
+        body = self._collect_plain(["smtp_host", "smtp_port", "smtp_username", "smtp_recipient", "smtp_password"])
         body["smtp_enabled"] = "true" if self._vars["smtp_enabled"].get() else "false"
         body = {k: v for k, v in body.items() if v is not None}
         try:
@@ -434,20 +404,6 @@ class SmtpSettingsTab(_SettingsTabBase):
         except ApiError as e:
             self._flash_saved(False, str(e))
             return False
-
-    def _replace_password(self):
-        try:
-            current = self.api.get("/config/system/secret/smtp_password").get("value", "")
-        except ApiError:
-            current = ""
-        value = _ask_secret(self, "Contraseña SMTP", "Contraseña:", initial=current)
-        if value is None:
-            return
-        try:
-            self.api.put("/config/system", {"smtp_password": value})
-            self._flash_saved(True)
-        except ApiError as e:
-            messagebox.showerror("ATANA", f"No se pudo guardar: {e}", parent=self)
 
 
 # ── Auto-update ──────────────────────────────────────────────────────────
@@ -463,8 +419,8 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
 
         self._start_group("CREDENCIALES")
         self._add_secret_row(
-            "github_token", "Personal Access Token", bool(sys_cfg.get("github_token_set")),
-            on_replace=self._replace_token,
+            "github_token", "Personal Access Token",
+            fetch_value=lambda: self.api.get("/config/system/secret/github_token").get("value", ""),
         )
         self._end_group()
 
@@ -483,7 +439,7 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
     def save(self) -> bool:
         if not self._loaded:
             return True
-        body = self._collect_plain(["github_owner", "github_repo"])
+        body = self._collect_plain(["github_owner", "github_repo", "github_token"])
         body = {k: v for k, v in body.items() if v is not None}
         try:
             self.api.put("/config/system", body)
@@ -492,20 +448,6 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
         except ApiError as e:
             self._flash_saved(False, str(e))
             return False
-
-    def _replace_token(self):
-        try:
-            current = self.api.get("/config/system/secret/github_token").get("value", "")
-        except ApiError:
-            current = ""
-        value = _ask_secret(self, "GitHub Token", "Personal Access Token:", initial=current)
-        if value is None:
-            return
-        try:
-            self.api.put("/config/system", {"github_token": value})
-            self._flash_saved(True)
-        except ApiError as e:
-            messagebox.showerror("ATANA", f"No se pudo guardar: {e}", parent=self)
 
 
 # ── Per-agent ────────────────────────────────────────────────────────────
@@ -528,6 +470,7 @@ class AgentConfigTab(_SettingsTabBase):
         super().__init__(parent, api, provider.upper())
         self.provider = provider
         self._extra_plain_keys: list[str] = []
+        self._extra_secret_keys: list[str] = []
         self._accounts: list[dict] = []
         self._start_form()
         self._build(agent)
@@ -538,8 +481,8 @@ class AgentConfigTab(_SettingsTabBase):
 
         self._add_field("username", "Usuario", "str", agent.get("username"))
         self._add_secret_row(
-            "password", "Contraseña / Token", bool(agent.get("has_password")),
-            on_replace=self._replace_password,
+            "password", "Contraseña / Token",
+            fetch_value=lambda: self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", ""),
         )
 
         for key, value in agent.items():
@@ -551,11 +494,11 @@ class AgentConfigTab(_SettingsTabBase):
             elif key.endswith("_set"):
                 logical = key[:-4]
                 is_totp = logical == "totp_secret"
+                self._extra_secret_keys.append(logical)
                 self._add_secret_row(
                     logical,
                     "TOTP (Google Authenticator)" if is_totp else logical.replace("_", " ").capitalize(),
-                    bool(value),
-                    on_replace=lambda k=logical: self._replace_extra_secret(k),
+                    fetch_value=lambda k=logical: self.api.get(f"/config/agents/{self.provider}/secret/{k}").get("value", ""),
                     extra=self._qr_button(logical) if is_totp else None,
                 )
 
@@ -575,7 +518,10 @@ class AgentConfigTab(_SettingsTabBase):
 
     def save(self) -> bool:
         body = self._collect_plain(
-            ["username"] + [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"] + self._extra_plain_keys
+            ["username", "password"]
+            + [k for k, _, _ in _AGENT_TOP_LEVEL_FIELDS if k != "enabled"]
+            + self._extra_plain_keys
+            + self._extra_secret_keys
         )
         body["enabled"] = self._vars["enabled"].get()
         for k in ("schedule_hour", "schedule_minute", "max_retries", "retry_interval_min"):
@@ -593,26 +539,6 @@ class AgentConfigTab(_SettingsTabBase):
         except ApiError as e:
             self._flash_saved(False, str(e))
             return False
-
-    def _replace_password(self):
-        try:
-            current = self.api.get(f"/config/agents/{self.provider}/secret/password").get("value", "")
-        except ApiError:
-            current = ""
-        value = _ask_secret(self, f"Contraseña — {self.provider.upper()}", "Contraseña / token del portal:", initial=current)
-        if value is None:
-            return
-        self._put_secret({"password": value})
-
-    def _replace_extra_secret(self, logical_key: str):
-        try:
-            current = self.api.get(f"/config/agents/{self.provider}/secret/{logical_key}").get("value", "")
-        except ApiError:
-            current = ""
-        value = _ask_secret(self, f"{logical_key} — {self.provider.upper()}", f"Valor de '{logical_key}':", initial=current)
-        if value is None:
-            return
-        self._put_secret({logical_key: value})
 
     def _put_secret(self, body: dict):
         try:
@@ -663,6 +589,8 @@ class AgentConfigTab(_SettingsTabBase):
         if not _confirm(self, "Confirmar TOTP", "Se detectó un secreto TOTP en el QR. ¿Guardarlo?"):
             return
         self._put_secret({logical_key: secret})
+        if logical_key in self._vars:
+            self._vars[logical_key].set(secret)  # refleja el nuevo valor en el campo inline
 
     # ── accounts (MercadoPago y cualquier agente con múltiples cuentas) ──
     # Sin límite de cantidad — "+ Agregar cuenta" siempre agrega una más.
@@ -688,26 +616,40 @@ class AgentConfigTab(_SettingsTabBase):
     def _render_accounts(self):
         for w in self._accounts_list.winfo_children():
             w.destroy()
+        self._account_vars: dict[str, tk.StringVar] = {}
 
         for acc in self._accounts:
-            alias    = acc.get("alias", "(sin alias)")
-            has_tok  = bool(acc.get("access_token_set"))
+            alias = acc.get("alias", "(sin alias)")
             row_f = tk.Frame(self._accounts_list)
             row_f.pack(fill="x", pady=2)
 
-            tk.Label(row_f, text=alias, font=_FIELD_FONT, width=24, anchor="w").pack(side="left")
-            tk.Label(
-                row_f, text="● token configurado" if has_tok else "○ sin token",
-                fg="#2f9e44" if has_tok else "#999999", font=("Segoe UI", 9),
-            ).pack(side="left", padx=8)
+            tk.Label(row_f, text=alias, font=_FIELD_FONT, width=18, anchor="w").pack(side="left")
+
+            var = tk.StringVar(value="")
+            self._account_vars[alias] = var
+            entry = tk.Entry(row_f, textvariable=var, show="•", width=28, font=("Consolas", 10))
+            entry.pack(side="left", padx=4)
+
+            show_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(
+                row_f, text="Mostrar", variable=show_var,
+                command=lambda e=entry, s=show_var: e.config(show="" if s.get() else "•"),
+            ).pack(side="left")
+
             tk.Button(
-                row_f, text="🔄 Token", relief="flat", cursor="hand2",
-                command=lambda a=alias: self._replace_account_token(a),
+                row_f, text="💾", relief="flat", cursor="hand2",
+                command=lambda a=alias: self._save_account_token(a),
             ).pack(side="left", padx=4)
             tk.Button(
                 row_f, text="✕", relief="flat", cursor="hand2", fg="#e03131",
                 command=lambda a=alias: self._remove_account(a),
             ).pack(side="left")
+
+            run_async_retrying(
+                self, work=lambda a=alias: self.api.get(f"/config/agents/{self.provider}/secret/accounts/{a}").get("value", ""),
+                on_done=lambda v, var=var: var.set(v or ""),
+                on_final_error=lambda e: None,
+            )
 
     def _add_account(self):
         win = tk.Toplevel(self)
@@ -741,15 +683,11 @@ class AgentConfigTab(_SettingsTabBase):
         tk.Button(btns, text="Agregar", command=_confirm_add, bg="#1971c2", fg="white", relief="flat", padx=12).pack(side="left", padx=4)
         tk.Button(btns, text="Cancelar", command=win.destroy, relief="flat", padx=12).pack(side="left")
 
-    def _replace_account_token(self, alias: str):
-        try:
-            current = self.api.get(f"/config/agents/{self.provider}/secret/accounts/{alias}").get("value", "")
-        except ApiError:
-            current = ""
-        value = _ask_secret(self, f"Token — {alias}", f"Access token de '{alias}':", initial=current)
-        if value is None:
+    def _save_account_token(self, alias: str):
+        var = self._account_vars.get(alias)
+        if var is None:
             return
-        self._save_accounts(extra_token={alias: value})
+        self._save_accounts(extra_token={alias: var.get()})
 
     def _remove_account(self, alias: str):
         if not _confirm(self, "Quitar cuenta", f"¿Quitar la cuenta '{alias}'?"):
@@ -818,17 +756,20 @@ class ConfigTab(ttk.Frame):
         self.api = api
         self._savable_tabs: list = []
 
-        header = tk.Frame(self, bg="#f0f0f0", pady=8, padx=16)
-        header.pack(fill="x", side="top")
+        # footer packed BEFORE the notebook so it claims its strip at the
+        # bottom first — otherwise the notebook's fill="both" expand=True
+        # would grab the whole frame and leave no room for it.
+        footer = tk.Frame(self, bg="#f0f0f0", pady=8, padx=16)
+        footer.pack(fill="x", side="bottom")
+
+        self._global_status = tk.Label(footer, text="", font=("Segoe UI", 9), bg="#f0f0f0")
+        self._global_status.pack(side="right", padx=12)
 
         tk.Button(
-            header, text="💾 Guardar todo", bg="#1971c2", fg="white",
+            footer, text="💾 Guardar todo", bg="#1971c2", fg="white",
             relief="flat", cursor="hand2", padx=16, pady=6,
             command=self._save_all,
-        ).pack(side="left")
-
-        self._global_status = tk.Label(header, text="", font=("Segoe UI", 9), bg="#f0f0f0")
-        self._global_status.pack(side="left", padx=12)
+        ).pack(side="right")
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
