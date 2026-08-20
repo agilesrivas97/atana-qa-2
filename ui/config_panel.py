@@ -69,6 +69,45 @@ _AGENT_TOP_LEVEL_KEYS = (
 # CREDENCIALES shows only the Cuentas editor for these, no Usuario/Contraseña.
 _PROVIDERS_WITHOUT_LOGIN = {"mercadopago"}
 
+# Per-provider extra secret fields that must always be offered in CREDENCIALES,
+# even before they've ever been set. The generic '<field>_set' loop in
+# AgentConfigTab._build() only picks up a field once its '<field>_enc' key
+# already exists somewhere in extra_config — a brand-new/never-configured row
+# has nothing to key off of, so without this registry the field simply never
+# appears and there'd be no way to set it the first time (mirrors
+# dispatcher/db.py's _AGENT_SECRET_EXTRA_FIELDS, plus the display label).
+_AGENT_EXTRA_SECRET_FIELDS = {
+    "fiserv":   [("totp_secret", "TOTP (Google Authenticator)")],
+    "naranjax": [("imap_password", "Contraseña IMAP")],
+}
+
+# Same problem, for the non-secret "otras cosas" extra fields (timezone, poll
+# settings, etc.): the loop over agent.items() in AgentConfigTab._build() only
+# shows a key that's already present in extra_config — a row with
+# extra_config = NULL/{} (never seeded, or reset) would render with none of
+# these, and there's no "+ agregar campo" to add one back. Registered here so
+# they always show, values blank until set.
+_AGENT_EXTRA_PLAIN_FIELDS = {
+    "mercadopago": [
+        ("timezone", "Zona horaria"),
+        ("separator", "Separador CSV"),
+        ("poll_interval_seg", "Intervalo de polling (seg)"),
+        ("poll_timeout_seg", "Timeout de polling (seg)"),
+    ],
+    "naranjax": [
+        ("imap_host", "Servidor IMAP"),
+        ("imap_username", "Usuario IMAP (email OTP)"),
+        ("otp_sender", "Remitente del OTP"),
+    ],
+}
+
+# Extra_config keys that exist in some rows (old seed data) but are dead —
+# no longer read by anything — so they're hidden from "otras cosas" even
+# though the generic agent.items() loop would otherwise pick them up. Left
+# untouched in the DB (update_agent_config only touches keys it's sent), just
+# not shown/editable here.
+_AGENT_HIDDEN_EXTRA_FIELDS = {"auth_mode"}
+
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
 
@@ -516,6 +555,22 @@ class AgentConfigTab(_SettingsTabBase):
             # si el seed nunca se completó o quedó vacío).
             self._build_accounts_section()
 
+        # Campos extra que este provider siempre debe poder configurar (ver
+        # _AGENT_EXTRA_SECRET_FIELDS) — el loop de arriba solo agrega la fila
+        # si '<field>_enc' ya existe en extra_config; esto cubre el caso de
+        # un agente recién dado de alta que todavía no tiene nada guardado.
+        already_rendered = set(self._extra_secret_keys)
+        for logical, label in _AGENT_EXTRA_SECRET_FIELDS.get(self.provider, []):
+            if logical in already_rendered:
+                continue
+            is_totp = logical == "totp_secret"
+            self._extra_secret_keys.append(logical)
+            self._add_secret_row(
+                logical, label,
+                fetch_value=lambda k=logical: self.api.get(f"/config/agents/{self.provider}/secret/{k}").get("value", ""),
+                extra=self._qr_button(logical) if is_totp else None,
+            )
+
         self._end_group()
 
         # ── otras cosas ───────────────────────────────────────────────────
@@ -525,8 +580,20 @@ class AgentConfigTab(_SettingsTabBase):
         for key, value in agent.items():
             if key in _AGENT_TOP_LEVEL_KEYS or key == "accounts" or key.endswith("_set"):
                 continue
+            if key in _AGENT_HIDDEN_EXTRA_FIELDS:
+                continue
             self._extra_plain_keys.append(key)
             self._add_field(key, key.replace("_", " ").capitalize(), "str", value)
+
+        # Igual que con los secretos extra arriba: agrega los campos que este
+        # provider siempre debería tener aunque extra_config no los traiga
+        # todavía (fila nunca configurada / extra_config vacío o NULL).
+        already_plain = set(self._extra_plain_keys)
+        for key, label in _AGENT_EXTRA_PLAIN_FIELDS.get(self.provider, []):
+            if key in already_plain:
+                continue
+            self._extra_plain_keys.append(key)
+            self._add_field(key, label, "str", agent.get(key))
 
         self._status_row()
 
