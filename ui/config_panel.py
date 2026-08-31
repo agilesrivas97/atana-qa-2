@@ -14,13 +14,13 @@ it, edit it in place, and it's sent back and encrypted server-side
 (dispatcher/db.py) on save, same as every other field.
 
 Loading: every tab that needs data shows a "Cargando..." placeholder first —
-window and Notebook appear instantly — and gets populated once its
-GET finishes, via ui/async_utils.run_async_retrying (background thread +
-Tk-safe handoff, retries the odd transient failure right after the panel
-opens). Two shared fetches feed the whole ConfigTab: one GET /config/system
-for General+SMTP+Auto-update (used to be 3 separate round-trips — one per
-tab — which is why this used to feel slow to open), one GET /config/agents
-for every agent tab.
+window and tabview appear instantly — and gets populated once its GET
+finishes, via ui/async_utils.run_async_retrying (background thread + Tk-safe
+handoff, retries the odd transient failure right after the panel opens). Two
+shared fetches feed the whole ConfigTab: one GET /config/system for
+General+SMTP+Auto-update (used to be 3 separate round-trips — one per tab —
+which is why this used to feel slow to open), one GET /config/agents for
+every agent tab.
 
 Saving: a single "💾 Guardar todo" button lives bottom-right of ConfigTab and
 saves every tab's fields — plain and secret alike — in one shot. MercadoPago
@@ -36,16 +36,28 @@ is back. Doing the PUTs inline on the main thread (the original approach)
 blocked the Tk event loop for the whole batch — several agents' worth of
 sequential HTTP round-trips — which is what caused the window to stop
 repainting and show stale/garbled text while "Guardando..." was up.
+
+UI toolkit: CustomTkinter (see ui/theme.py for the shared palette and the
+TitledFrame helper standing in for tk.LabelFrame, which CTk has no
+equivalent of). The per-agent/per-section tabs used to be pages added
+directly to a ttk.Notebook; now they're plain frames packed INSIDE the
+frame a ctk.CTkTabview hands back from .add(name) — see ConfigTab. That's
+the only structural change from the ttk.Notebook days; every tab class
+below (_SettingsTabBase and its subclasses) is otherwise unchanged, since
+it's still just "a widget with a parent" either way.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 from shared.api_client import ApiClient, ApiError
+from ui import theme
 from ui.async_utils import run_async, run_async_retrying
 
-_FIELD_FONT = ("Segoe UI", 10)
-_LABEL_FONT = ("Segoe UI", 10, "bold")
+_FIELD_FONT = theme.FONT_BODY
+_LABEL_FONT = theme.FONT_SUBTITLE
 
 _AGENT_TOP_LEVEL_FIELDS = [
     # (key, label, kind)  kind in {str, int, bool, folder} — 'username' excluded,
@@ -108,6 +120,25 @@ _AGENT_EXTRA_PLAIN_FIELDS = {
 # not shown/editable here.
 _AGENT_HIDDEN_EXTRA_FIELDS = {"auth_mode"}
 
+# Agent tabs in the order they should appear — the two live/implemented
+# agents first (in this order), then anything else (future or not-yet-
+# available providers) alphabetically after them.
+_AGENT_TAB_PRIORITY = ["fiserv", "mercadopago"]
+
+# Small icon per agent tab, for quick scanning — falls back to a generic
+# robot/construction icon for a provider with no entry here (any future
+# agent, or one of the not-yet-implemented ones).
+_AGENT_TAB_ICONS = {"fiserv": "🏦", "mercadopago": "💳"}
+
+
+def _agent_tab_sort_key(agent: dict):
+    provider = agent.get("provider", "")
+    try:
+        priority = _AGENT_TAB_PRIORITY.index(provider)
+    except ValueError:
+        priority = len(_AGENT_TAB_PRIORITY)
+    return (priority, provider)
+
 
 # ── Small reusable dialogs ──────────────────────────────────────────────────
 
@@ -115,21 +146,21 @@ def _confirm(parent, title: str, message: str) -> bool:
     return messagebox.askyesno(title, message, parent=parent)
 
 
-class _LoadingPlaceholder(ttk.Frame):
+class _LoadingPlaceholder(ctk.CTkFrame):
     """Centered 'Cargando...' shown the instant a tab is created, before its
     data has come back from the API."""
 
     def __init__(self, parent, text: str = "Cargando..."):
-        super().__init__(parent)
-        wrap = tk.Frame(self)
+        super().__init__(parent, fg_color="transparent")
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
         wrap.place(relx=0.5, rely=0.4, anchor="center")
-        tk.Label(wrap, text=text, font=("Segoe UI", 11), fg="#999999").pack()
+        ctk.CTkLabel(wrap, text=text, font=(theme.FONT_FAMILY, 11), text_color=theme.TEXT_DIM).pack()
 
     def save(self) -> bool:
         return True
 
 
-class _SettingsTabBase(ttk.Frame):
+class _SettingsTabBase(ctk.CTkFrame):
     """
     Common scaffolding for a settings form: shows a 'Cargando...' placeholder
     on construction (no network call happens in __init__ — see ConfigTab,
@@ -140,42 +171,45 @@ class _SettingsTabBase(ttk.Frame):
     Supports one nested "grouped" section (used for the CREDENCIALES box —
     usuario/password/tokens visually separated from the rest) via
     _start_group()/_end_group(): fields added in between go inside a
-    LabelFrame instead of directly on the tab.
+    theme.TitledFrame instead of directly on the tab.
     """
 
     def __init__(self, parent, api: ApiClient, title: str):
-        super().__init__(parent)
+        super().__init__(parent, fg_color="transparent")
         self.api = api
         self._title = title
         self._vars: dict[str, tk.Variable] = {}
         self._row = 0
-        self._save_status: tk.Label | None = None
+        self._save_status: ctk.CTkLabel | None = None
         self.form = self
 
-        self._loading = tk.Label(self, text=f"{title}\n\nCargando...", font=("Segoe UI", 11), fg="#999999")
+        self._loading = ctk.CTkLabel(
+            self, text=f"{title}\n\nCargando...", font=(theme.FONT_FAMILY, 11), text_color=theme.TEXT_DIM,
+        )
         self._loading.place(relx=0.5, rely=0.4, anchor="center")
 
     def _start_form(self):
         """Call once, at the top of populate() — clears the loading
         placeholder and starts the real grid layout."""
         self._loading.destroy()
-        tk.Label(self, text=self._title, font=("Segoe UI", 13, "bold")).grid(
+        ctk.CTkLabel(self, text=self._title, font=theme.FONT_TITLE).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 8),
         )
         self._row = 1
 
     def _start_group(self, title: str):
-        """Opens a bordered LabelFrame ('CREDENCIALES', etc) — subsequent
-        _add_field/_add_secret_row calls land inside it until _end_group()."""
+        """Opens a bordered card ('CREDENCIALES', etc) — subsequent
+        _add_field/_add_secret_row calls land inside its .body until
+        _end_group()."""
         row = self._row
-        box = tk.LabelFrame(self, text=title, font=_LABEL_FONT, padx=12, pady=8)
+        box = theme.TitledFrame(self, title)
         box.grid(row=row, column=0, columnspan=3, sticky="we", padx=16, pady=(4, 10))
-        box.grid_columnconfigure(1, weight=1)
+        box.body.grid_columnconfigure(1, weight=1)
         self._row += 1
 
         self._outer_form = self.form
         self._outer_row  = self._row
-        self.form = box
+        self.form = box.body
         self._row = 0
 
     def _end_group(self):
@@ -184,22 +218,23 @@ class _SettingsTabBase(ttk.Frame):
 
     def _add_field(self, key: str, label: str, kind: str, value):
         row = self._row
-        tk.Label(self.form, text=label, font=_FIELD_FONT).grid(row=row, column=0, sticky="w", padx=16, pady=4)
+        ctk.CTkLabel(self.form, text=label, font=_FIELD_FONT).grid(row=row, column=0, sticky="w", padx=16, pady=4)
 
         if kind == "bool":
             var = tk.BooleanVar(value=bool(value))
-            tk.Checkbutton(self.form, variable=var).grid(row=row, column=1, sticky="w", padx=4)
+            ctk.CTkCheckBox(self.form, text="", variable=var, width=24).grid(row=row, column=1, sticky="w", padx=4)
         elif kind == "folder":
             var = tk.StringVar(value=str(value) if value is not None else "")
-            entry = tk.Entry(self.form, textvariable=var, width=44, font=_FIELD_FONT)
+            entry = ctk.CTkEntry(self.form, textvariable=var, width=300, font=_FIELD_FONT)
             entry.grid(row=row, column=1, sticky="w", padx=4)
-            tk.Button(
-                self.form, text="📁", relief="flat", cursor="hand2",
+            ctk.CTkButton(
+                self.form, text="📁", width=48, height=32, font=theme.FONT_ICON,
+                fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
                 command=lambda v=var: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get()),
             ).grid(row=row, column=2, sticky="w")
         else:
             var = tk.StringVar(value="" if value is None else str(value))
-            tk.Entry(self.form, textvariable=var, width=46, font=_FIELD_FONT).grid(row=row, column=1, sticky="w", padx=4)
+            ctk.CTkEntry(self.form, textvariable=var, width=320, font=_FIELD_FONT).grid(row=row, column=1, sticky="w", padx=4)
 
         self._vars[key] = var
         self._row += 1
@@ -215,21 +250,21 @@ class _SettingsTabBase(ttk.Frame):
         whatever's in the box when 'Guardar todo' runs gets sent back and
         re-encrypted server-side."""
         row = self._row
-        tk.Label(self.form, text=label, font=_FIELD_FONT).grid(row=row, column=0, sticky="w", padx=16, pady=4)
+        ctk.CTkLabel(self.form, text=label, font=_FIELD_FONT).grid(row=row, column=0, sticky="w", padx=16, pady=4)
 
         var = tk.StringVar(value="")
-        entry = tk.Entry(self.form, textvariable=var, show="•", width=38, font=("Consolas", 10))
+        entry = ctk.CTkEntry(self.form, textvariable=var, show="•", width=260, font=theme.FONT_MONO_BODY)
         entry.grid(row=row, column=1, sticky="w", padx=4)
         self._vars[key] = var
 
         show_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            self.form, text="Mostrar", variable=show_var,
-            command=lambda: entry.config(show="" if show_var.get() else "•"),
+        ctk.CTkCheckBox(
+            self.form, text="Mostrar", variable=show_var, font=theme.FONT_SMALL,
+            command=lambda: entry.configure(show="" if show_var.get() else "•"),
         ).grid(row=row, column=2, sticky="w")
 
         if extra:
-            extra_frame = tk.Frame(self.form)
+            extra_frame = ctk.CTkFrame(self.form, fg_color="transparent")
             extra_frame.grid(row=row, column=3, sticky="w", padx=(6, 0))
             extra(extra_frame)
 
@@ -259,17 +294,17 @@ class _SettingsTabBase(ttk.Frame):
         """Small inline feedback label — no button. Saving itself happens via
         ConfigTab's single global 'Guardar todo'."""
         row = self._row + 1
-        self._save_status = tk.Label(self, text="", font=("Segoe UI", 9))
+        self._save_status = ctk.CTkLabel(self, text="", font=theme.FONT_SMALL)
         self._save_status.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 12))
 
     def _flash_saved(self, ok: bool, detail: str = ""):
         if self._save_status is None:
             return
         if ok:
-            self._save_status.config(text="Guardado ✔", fg="#2f9e44")
+            self._save_status.configure(text="Guardado ✔", text_color=theme.SUCCESS)
         else:
-            self._save_status.config(text=f"Error: {detail}", fg="#e03131")
-        self.after(4000, lambda: self._save_status.config(text=""))
+            self._save_status.configure(text=f"Error: {detail}", text_color=theme.DANGER)
+        self.after(4000, lambda: self._save_status.configure(text=""))
 
     def _build_save_job(self) -> dict | None:
         """
@@ -315,23 +350,24 @@ class GeneralSettingsTab(_SettingsTabBase):
 
     def _build_operation_section(self):
         row = self._row + 2
-        op = tk.LabelFrame(self, text="Operación", font=_LABEL_FONT, padx=12, pady=12)
+        op = theme.TitledFrame(self, "Operación")
         op.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 0))
         self._row = row + 1
 
-        tk.Label(
-            op, text="Reinicia el proceso del dispatcher (servicio Windows). Se recupera solo\n"
-                      "en ~15s — cualquier job a mitad de camino se retoma en el próximo ciclo.",
-            font=("Segoe UI", 9), fg="#666666", justify="left",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ctk.CTkLabel(
+            op.body, text="Reinicia el proceso del dispatcher (servicio Windows). Se recupera solo\n"
+                          "en ~15s — cualquier job a mitad de camino se retoma en el próximo ciclo.",
+            font=theme.FONT_SMALL, text_color=theme.TEXT_DIM, justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 8))
 
-        tk.Button(
-            op, text="🔄 Reiniciar servicio", relief="flat", cursor="hand2",
-            padx=10, pady=4, command=self._restart_service,
-        ).grid(row=1, column=0, sticky="w")
+        ctk.CTkButton(
+            op.body, text="🔄 Reiniciar servicio", width=200, font=_FIELD_FONT,
+            fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
+            command=self._restart_service,
+        ).grid(row=1, column=0, sticky="w", padx=10)
 
-        self._op_status = tk.Label(op, text="", font=("Segoe UI", 9))
-        self._op_status.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self._op_status = ctk.CTkLabel(op.body, text="", font=theme.FONT_SMALL)
+        self._op_status.grid(row=2, column=0, sticky="w", padx=10, pady=(8, 0))
 
     def _restart_service(self):
         if not _confirm(
@@ -343,33 +379,35 @@ class GeneralSettingsTab(_SettingsTabBase):
             return
         try:
             self.api.post("/service/restart")
-            self._op_status.config(text="Reiniciando... puede tardar ~15-20s en volver.", fg="#1971c2")
+            self._op_status.configure(text="Reiniciando... puede tardar ~15-20s en volver.", text_color=theme.PRIMARY)
         except ApiError as e:
-            self._op_status.config(text=f"Error: {e}", fg="#e03131")
+            self._op_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
 
     def _build_security_section(self):
         row = self._row + 1
-        sec = tk.LabelFrame(self, text="Seguridad", font=_LABEL_FONT, padx=12, pady=12)
+        sec = theme.TitledFrame(self, "Seguridad")
         sec.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=16)
 
-        tk.Label(
-            sec, text="Rotar la API key es instantáneo. Rotar las claves maestras\n"
+        ctk.CTkLabel(
+            sec.body, text="Rotar la API key es instantáneo. Rotar las claves maestras\n"
                        "re-encripta (o invalida) todas las credenciales guardadas — puede tardar un momento.",
-            font=("Segoe UI", 9), fg="#666666", justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            font=theme.FONT_SMALL, text_color=theme.TEXT_DIM, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
 
-        tk.Button(
-            sec, text="🔄 Regenerar API key", relief="flat", cursor="hand2",
-            padx=10, pady=4, command=self._rotate_api_key,
-        ).grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkButton(
+            sec.body, text="🔄 Regenerar API key", width=190, font=_FIELD_FONT,
+            fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
+            command=self._rotate_api_key,
+        ).grid(row=1, column=0, sticky="w", padx=(10, 8))
 
-        tk.Button(
-            sec, text="🔄 Rotar claves maestras (fernet + session)", relief="flat", cursor="hand2",
-            padx=10, pady=4, command=self._rotate_master,
+        ctk.CTkButton(
+            sec.body, text="🔄 Rotar claves maestras (fernet + session)", width=320, font=_FIELD_FONT,
+            fg_color=theme.DANGER, hover_color=theme.DANGER_HOVER,
+            command=self._rotate_master,
         ).grid(row=1, column=1, sticky="w")
 
-        self._sec_status = tk.Label(sec, text="", font=("Segoe UI", 9))
-        self._sec_status.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._sec_status = ctk.CTkLabel(sec.body, text="", font=theme.FONT_SMALL)
+        self._sec_status.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0))
 
     def _rotate_api_key(self):
         if not _confirm(self, "Regenerar API key",
@@ -379,9 +417,9 @@ class GeneralSettingsTab(_SettingsTabBase):
         try:
             resp = self.api.post("/config/keys/rotate-api-key")
             self.api.api_key = resp.get("api_key", self.api.api_key)
-            self._sec_status.config(text="API key regenerada ✔", fg="#2f9e44")
+            self._sec_status.configure(text="API key regenerada ✔", text_color=theme.SUCCESS)
         except ApiError as e:
-            self._sec_status.config(text=f"Error: {e}", fg="#e03131")
+            self._sec_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
 
     def _rotate_master(self):
         if not _confirm(
@@ -396,25 +434,25 @@ class GeneralSettingsTab(_SettingsTabBase):
         except ApiError as e:
             messagebox.showerror("ATANA", f"No se pudo iniciar la rotación: {e}", parent=self)
             return
-        self._sec_status.config(text="Rotando...", fg="#1971c2")
+        self._sec_status.configure(text="Rotando...", text_color=theme.PRIMARY)
         self.after(1500, self._poll_rotation)
 
     def _poll_rotation(self):
         try:
             status = self.api.get("/config/keys/rotate-status")
         except ApiError as e:
-            self._sec_status.config(text=f"Error consultando estado: {e}", fg="#e03131")
+            self._sec_status.configure(text=f"Error consultando estado: {e}", text_color=theme.DANGER)
             return
 
         state = status.get("state")
         if state == "running":
             self.after(1500, self._poll_rotation)
         elif state == "done":
-            self._sec_status.config(text="Rotación completada ✔", fg="#2f9e44")
+            self._sec_status.configure(text="Rotación completada ✔", text_color=theme.SUCCESS)
         elif state == "error":
-            self._sec_status.config(text=f"Falló — claves anteriores siguen vigentes: {status.get('detail')}", fg="#e03131")
+            self._sec_status.configure(text=f"Falló — claves anteriores siguen vigentes: {status.get('detail')}", text_color=theme.DANGER)
         else:
-            self._sec_status.config(text="")
+            self._sec_status.configure(text="")
 
 
 # ── SMTP ─────────────────────────────────────────────────────────────────
@@ -474,9 +512,9 @@ class AutoUpdateSettingsTab(_SettingsTabBase):
         self._add_field("github_owner", "Usuario / organización", "str", sys_cfg.get("github_owner", ""))
         self._add_field("github_repo",  "Repositorio",            "str", sys_cfg.get("github_repo", ""))
 
-        tk.Label(
+        ctk.CTkLabel(
             self, text="Dejar el token en blanco desactiva el auto-update.",
-            font=("Segoe UI", 9), fg="#666666",
+            font=theme.FONT_SMALL, text_color=theme.TEXT_DIM,
         ).grid(row=self._row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
         self._row += 1
 
@@ -632,8 +670,9 @@ class AgentConfigTab(_SettingsTabBase):
 
     def _qr_button(self, logical_key: str):
         def _factory(parent_frame):
-            tk.Button(
-                parent_frame, text="📷 Generar desde foto del QR", relief="flat", cursor="hand2",
+            ctk.CTkButton(
+                parent_frame, text="📷 Generar desde foto del QR", width=230, font=_FIELD_FONT,
+                fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
                 command=lambda: self._upload_qr(logical_key),
             ).pack(side="left", padx=(6, 0))
         return _factory
@@ -674,15 +713,16 @@ class AgentConfigTab(_SettingsTabBase):
 
     def _build_accounts_section(self):
         row = self._row
-        box = tk.LabelFrame(self.form, text="Cuentas", font=_LABEL_FONT, padx=10, pady=10)
+        box = theme.TitledFrame(self.form, "Cuentas")
         box.grid(row=row, column=0, columnspan=3, sticky="we", padx=4, pady=8)
         self._row += 1
 
-        self._accounts_list = tk.Frame(box)
+        self._accounts_list = ctk.CTkFrame(box.body, fg_color="transparent")
         self._accounts_list.pack(fill="x")
 
-        tk.Button(
-            box, text="+ Agregar cuenta", relief="flat", cursor="hand2",
+        ctk.CTkButton(
+            box.body, text="+ Agregar cuenta", width=170, font=_FIELD_FONT,
+            fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
             command=self._add_account,
         ).pack(anchor="w", pady=(8, 0))
 
@@ -695,28 +735,30 @@ class AgentConfigTab(_SettingsTabBase):
 
         for acc in self._accounts:
             alias = acc.get("alias", "(sin alias)")
-            row_f = tk.Frame(self._accounts_list)
+            row_f = ctk.CTkFrame(self._accounts_list, fg_color="transparent")
             row_f.pack(fill="x", pady=2)
 
-            tk.Label(row_f, text=alias, font=_FIELD_FONT, width=18, anchor="w").pack(side="left")
+            ctk.CTkLabel(row_f, text=alias, font=_FIELD_FONT, width=140, anchor="w").pack(side="left")
 
             var = tk.StringVar(value="")
             self._account_vars[alias] = var
-            entry = tk.Entry(row_f, textvariable=var, show="•", width=28, font=("Consolas", 10))
+            entry = ctk.CTkEntry(row_f, textvariable=var, show="•", width=220, font=theme.FONT_MONO_BODY)
             entry.pack(side="left", padx=4)
 
             show_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(
-                row_f, text="Mostrar", variable=show_var,
-                command=lambda e=entry, s=show_var: e.config(show="" if s.get() else "•"),
+            ctk.CTkCheckBox(
+                row_f, text="Mostrar", variable=show_var, font=theme.FONT_SMALL,
+                command=lambda e=entry, s=show_var: e.configure(show="" if s.get() else "•"),
             ).pack(side="left")
 
-            tk.Button(
-                row_f, text="💾", relief="flat", cursor="hand2",
+            ctk.CTkButton(
+                row_f, text="💾", width=48, height=32, font=theme.FONT_ICON,
+                fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
                 command=lambda a=alias: self._save_account_token(a),
             ).pack(side="left", padx=4)
-            tk.Button(
-                row_f, text="✕", relief="flat", cursor="hand2", fg="#e03131",
+            ctk.CTkButton(
+                row_f, text="✕", width=48, height=32, font=theme.FONT_ICON,
+                fg_color=theme.DANGER, hover_color=theme.DANGER_HOVER,
                 command=lambda a=alias: self._remove_account(a),
             ).pack(side="left")
 
@@ -727,18 +769,21 @@ class AgentConfigTab(_SettingsTabBase):
             )
 
     def _add_account(self):
-        win = tk.Toplevel(self)
+        win = ctk.CTkToplevel(self)
         win.title("Agregar cuenta")
         win.transient(self.winfo_toplevel())
-        win.grab_set()
+        # Pequeña demora antes de grab_set(): CTkToplevel puede no estar
+        # completamente mapeada todavía en el instante en que se crea, y
+        # pedir el grab antes de eso puede fallar en algunas plataformas.
+        win.after(100, win.grab_set)
 
-        tk.Label(win, text="Alias:", font=_FIELD_FONT).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        ctk.CTkLabel(win, text="Alias:", font=_FIELD_FONT).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
         alias_var = tk.StringVar()
-        tk.Entry(win, textvariable=alias_var, width=30).grid(row=0, column=1, padx=12, pady=(12, 4))
+        ctk.CTkEntry(win, textvariable=alias_var, width=220).grid(row=0, column=1, padx=12, pady=(12, 4))
 
-        tk.Label(win, text="Access token:", font=_FIELD_FONT).grid(row=1, column=0, sticky="w", padx=12, pady=4)
+        ctk.CTkLabel(win, text="Access token:", font=_FIELD_FONT).grid(row=1, column=0, sticky="w", padx=12, pady=4)
         token_var = tk.StringVar()
-        tk.Entry(win, textvariable=token_var, width=30, show="•").grid(row=1, column=1, padx=12, pady=4)
+        ctk.CTkEntry(win, textvariable=token_var, width=220, show="•").grid(row=1, column=1, padx=12, pady=4)
 
         def _confirm_add():
             alias = alias_var.get().strip()
@@ -749,35 +794,53 @@ class AgentConfigTab(_SettingsTabBase):
             if any(a.get("alias") == alias for a in self._accounts):
                 messagebox.showerror("ATANA", "Ya existe una cuenta con ese alias.", parent=win)
                 return
-            self._accounts.append({"alias": alias, "access_token_set": bool(token)})
-            self._save_accounts(extra_token={alias: token} if token else {})
+            next_accounts = self._accounts + [{"alias": alias, "access_token_set": bool(token)}]
+            self._save_accounts(next_accounts, extra_token={alias: token} if token else {})
             win.destroy()
 
-        btns = tk.Frame(win, pady=12, padx=12)
-        btns.grid(row=2, column=0, columnspan=2)
-        tk.Button(btns, text="Agregar", command=_confirm_add, bg="#1971c2", fg="white", relief="flat", padx=12).pack(side="left", padx=4)
-        tk.Button(btns, text="Cancelar", command=win.destroy, relief="flat", padx=12).pack(side="left")
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=2, column=0, columnspan=2, pady=12, padx=12)
+        ctk.CTkButton(
+            btns, text="Agregar", command=_confirm_add, width=100,
+            fg_color=theme.PRIMARY, hover_color=theme.PRIMARY_HOVER,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btns, text="Cancelar", command=win.destroy, width=100,
+            fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
+        ).pack(side="left")
+
+        win.bind("<Return>", lambda e: _confirm_add())
+        win.bind("<Escape>", lambda e: win.destroy())
 
     def _save_account_token(self, alias: str):
         var = self._account_vars.get(alias)
         if var is None:
             return
-        self._save_accounts(extra_token={alias: var.get()})
+        self._save_accounts(self._accounts, extra_token={alias: var.get()})
 
     def _remove_account(self, alias: str):
         if not _confirm(self, "Quitar cuenta", f"¿Quitar la cuenta '{alias}'?"):
             return
-        self._accounts = [a for a in self._accounts if a.get("alias") != alias]
-        self._save_accounts()
+        next_accounts = [a for a in self._accounts if a.get("alias") != alias]
+        self._save_accounts(next_accounts)
 
-    def _save_accounts(self, extra_token: dict | None = None):
-        """Sends the full accounts list back. Only aliases present in
-        `extra_token` carry a plaintext access_token — everything else is
-        merged server-side against the previously stored token (see
-        dispatcher/db.py update_agent_config)."""
+    def _save_accounts(self, accounts: list[dict], extra_token: dict | None = None):
+        """Sends `accounts` back. Only aliases present in `extra_token` carry
+        a plaintext access_token — everything else is merged server-side
+        against the previously stored token (see dispatcher/db.py
+        update_agent_config).
+
+        Takes the WOULD-BE list as a parameter instead of reading/mutating
+        self._accounts directly, and only commits it to self._accounts once
+        the PUT actually succeeds — add/remove used to mutate self._accounts
+        up front, before the request, so a failed save (network hiccup, API
+        down) left local state silently out of sync with the server: a
+        'quitar cuenta' that failed would still make the account disappear
+        from the DB on the NEXT unrelated successful save, well after the
+        error dialog told you nothing had happened."""
         extra_token = extra_token or {}
         payload = []
-        for acc in self._accounts:
+        for acc in accounts:
             item = {k: v for k, v in acc.items() if k != "access_token_set"}
             if acc.get("alias") in extra_token:
                 item["access_token"] = extra_token[acc["alias"]]
@@ -785,6 +848,7 @@ class AgentConfigTab(_SettingsTabBase):
 
         try:
             self.api.put(f"/config/agents/{self.provider}", {"accounts": payload})
+            self._accounts = accounts
             self._render_accounts()
             self._flash_saved(True)
         except ApiError as e:
@@ -793,7 +857,7 @@ class AgentConfigTab(_SettingsTabBase):
 
 # ── Agentes aún no disponibles ───────────────────────────────────────────
 
-class _UnavailableAgentTab(ttk.Frame):
+class _UnavailableAgentTab(ctk.CTkFrame):
     """
     Placeholder para providers que ya tienen fila en agent_config (seed_config.sql)
     pero todavía no tienen bot implementado (agent_loader.known_providers() no
@@ -801,14 +865,14 @@ class _UnavailableAgentTab(ttk.Frame):
     """
 
     def __init__(self, parent, provider: str):
-        super().__init__(parent)
-        wrap = tk.Frame(self)
+        super().__init__(parent, fg_color="transparent")
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
         wrap.place(relx=0.5, rely=0.4, anchor="center")
 
-        tk.Label(wrap, text=provider.upper(), font=("Segoe UI", 14, "bold"), fg="#999999").pack()
-        tk.Label(
+        ctk.CTkLabel(wrap, text=provider.upper(), font=(theme.FONT_FAMILY, 14, "bold"), text_color=theme.TEXT_DIM).pack()
+        ctk.CTkLabel(
             wrap, text="Este agente todavía no está disponible.",
-            font=_FIELD_FONT, fg="#666666",
+            font=_FIELD_FONT, text_color=theme.TEXT_DIM,
         ).pack(pady=(6, 0))
 
     def save(self) -> bool:
@@ -817,9 +881,9 @@ class _UnavailableAgentTab(ttk.Frame):
 
 # ── Orchestrator tab ─────────────────────────────────────────────────────
 
-class ConfigTab(ttk.Frame):
+class ConfigTab(ctk.CTkFrame):
     """
-    Builds its whole shell (header + Notebook + one placeholder tab each)
+    Builds its whole shell (footer + CTkTabview + one placeholder tab each)
     synchronously — this is all just widget construction, no network calls,
     so the window appears immediately. The two GETs that feed every tab
     (/config/system, /config/agents) run in the background via
@@ -827,37 +891,46 @@ class ConfigTab(ttk.Frame):
     """
 
     def __init__(self, parent, api: ApiClient):
-        super().__init__(parent)
+        super().__init__(parent, fg_color="transparent")
         self.api = api
         self._savable_tabs: list = []
 
-        # footer packed BEFORE the notebook so it claims its strip at the
-        # bottom first — otherwise the notebook's fill="both" expand=True
+        # footer packed BEFORE the tabview so it claims its strip at the
+        # bottom first — otherwise the tabview's fill="both" expand=True
         # would grab the whole frame and leave no room for it.
-        footer = tk.Frame(self, bg="#f0f0f0", pady=8, padx=16)
-        footer.pack(fill="x", side="bottom")
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", padx=16, pady=8)
 
-        self._global_status = tk.Label(footer, text="", font=("Segoe UI", 9), bg="#f0f0f0")
+        self._global_status = ctk.CTkLabel(footer, text="", font=theme.FONT_SMALL)
         self._global_status.pack(side="right", padx=12)
 
-        tk.Button(
-            footer, text="💾 Guardar todo", bg="#1971c2", fg="white",
-            relief="flat", cursor="hand2", padx=16, pady=6,
+        ctk.CTkButton(
+            footer, text="💾 Guardar todo", width=170, font=_FIELD_FONT,
+            fg_color=theme.PRIMARY, hover_color=theme.PRIMARY_HOVER,
             command=self._save_all,
         ).pack(side="right")
 
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True)
+        self.tabview = ctk.CTkTabview(self, fg_color="transparent")
+        self.tabview.pack(fill="both", expand=True)
 
-        self.general_tab = GeneralSettingsTab(self.notebook, api)
-        self.smtp_tab    = SmtpSettingsTab(self.notebook, api)
-        self.update_tab  = AutoUpdateSettingsTab(self.notebook, api)
-        for tab, label in ((self.general_tab, "General"), (self.smtp_tab, "SMTP"), (self.update_tab, "Auto-update")):
-            self.notebook.add(tab, text=label)
-            self._savable_tabs.append(tab)
+        general_frame = self.tabview.add("🔧  General")
+        smtp_frame    = self.tabview.add("✉️  SMTP")
+        update_frame  = self.tabview.add("🔄  Auto-update")
+        # Placeholder tab — deleted and replaced by real per-agent tabs once
+        # GET /config/agents lands (see _on_agents_loaded).
+        self._agents_tab_key = "🤖  Agentes"
+        agents_frame = self.tabview.add(self._agents_tab_key)
 
-        self._agents_placeholder = _LoadingPlaceholder(self.notebook, "Cargando agentes...")
-        self.notebook.add(self._agents_placeholder, text="Agentes")
+        self.general_tab = GeneralSettingsTab(general_frame, api)
+        self.general_tab.pack(fill="both", expand=True)
+        self.smtp_tab = SmtpSettingsTab(smtp_frame, api)
+        self.smtp_tab.pack(fill="both", expand=True)
+        self.update_tab = AutoUpdateSettingsTab(update_frame, api)
+        self.update_tab.pack(fill="both", expand=True)
+        self._savable_tabs += [self.general_tab, self.smtp_tab, self.update_tab]
+
+        self._agents_placeholder = _LoadingPlaceholder(agents_frame, "Cargando agentes...")
+        self._agents_placeholder.pack(fill="both", expand=True)
 
         # retrying, not one-shot: right after the panel opens, the dispatcher's
         # local API may not have bound its port yet (window shows up first) —
@@ -884,17 +957,19 @@ class ConfigTab(ttk.Frame):
         self.update_tab.populate(sys_cfg)
 
     def _on_agents_loaded(self, agents: list):
-        self.notebook.forget(self._agents_placeholder)
-        self._agents_placeholder.destroy()
+        self.tabview.delete(self._agents_tab_key)
 
-        for agent in sorted(agents, key=lambda a: a.get("provider", "")):
-            provider = agent["provider"]
-            if agent.get("available", True):
-                tab = AgentConfigTab(self.notebook, self.api, provider, agent)
+        for agent in sorted(agents, key=_agent_tab_sort_key):
+            provider  = agent["provider"]
+            available = agent.get("available", True)
+            icon = _AGENT_TAB_ICONS.get(provider, "🤖" if available else "🚧")
+            tab_frame = self.tabview.add(f"{icon}  {provider.capitalize()}")
+            if available:
+                tab = AgentConfigTab(tab_frame, self.api, provider, agent)
                 self._savable_tabs.append(tab)
             else:
-                tab = _UnavailableAgentTab(self.notebook, provider)
-            self.notebook.add(tab, text=provider.capitalize())
+                tab = _UnavailableAgentTab(tab_frame, provider)
+            tab.pack(fill="both", expand=True)
 
     def _save_all(self):
         """
@@ -915,11 +990,11 @@ class ConfigTab(ttk.Frame):
                 jobs.append(job)
 
         if not jobs:
-            self._global_status.config(text="Nada para guardar", fg="#999999")
-            self.after(3000, lambda: self._global_status.config(text=""))
+            self._global_status.configure(text="Nada para guardar", text_color=theme.TEXT_DIM)
+            self.after(3000, lambda: self._global_status.configure(text=""))
             return
 
-        self._global_status.config(text="Guardando...", fg="#1971c2")
+        self._global_status.configure(text="Guardando...", text_color=theme.PRIMARY)
 
         def _send_all():
             results = []
@@ -934,7 +1009,7 @@ class ConfigTab(ttk.Frame):
         run_async(
             self, work=_send_all,
             on_done=self._on_save_all_done,
-            on_error=lambda e: self._global_status.config(text=f"Error: {e}", fg="#e03131"),
+            on_error=lambda e: self._global_status.configure(text=f"Error: {e}", text_color=theme.DANGER),
         )
 
     def _on_save_all_done(self, results: list):
@@ -949,9 +1024,9 @@ class ConfigTab(ttk.Frame):
                 failed.append(f"{title} ({detail})" if detail else str(title))
 
         if failed:
-            self._global_status.config(
-                text=f"{ok_count} guardado(s), falló: {', '.join(failed)}", fg="#e03131",
+            self._global_status.configure(
+                text=f"{ok_count} guardado(s), falló: {', '.join(failed)}", text_color=theme.DANGER,
             )
         else:
-            self._global_status.config(text=f"Todo guardado ✔ ({ok_count})", fg="#2f9e44")
-        self.after(6000, lambda: self._global_status.config(text=""))
+            self._global_status.configure(text=f"Todo guardado ✔ ({ok_count})", text_color=theme.SUCCESS)
+        self.after(6000, lambda: self._global_status.configure(text=""))

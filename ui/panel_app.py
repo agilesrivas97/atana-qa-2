@@ -1,20 +1,30 @@
 """
 ui/panel_app.py
 ================
-Main window for the panel: a Notebook with "General" (live status overview,
-same data the old ui/tui.py showed) and "Configuración" (ui/config_panel.py).
+Main window for the panel: a CTkTabview with "General" (live status overview,
+same data the old ui/tui.py showed), "TOTP" (ui/totp_tool.py) and
+"Configuración" (ui/config_panel.py).
 
 Everything here goes through shared/api_client.py — no direct DB access.
+
+UI toolkit: CustomTkinter (still Tkinter underneath — same .after()/threading
+rules as before, see ui/async_utils.py) instead of plain tk/ttk, for a
+modern look. Two things stay plain Tkinter deliberately: ttk.Treeview (no CTk
+table/list widget exists) and tkinter.messagebox/filedialog (native OS
+dialogs — correct to leave unskinned). See ui/theme.py for the palette and
+the TitledFrame helper that stands in for the tk.LabelFrame this used to use.
 """
 
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 
+import customtkinter as ctk
 from loguru import logger
 
 from shared.api_client import ApiClient, ApiError
 from shared.paths import BASE_DIR as _BASE_DIR
+from ui import theme
 from ui.async_utils import run_async_retrying
 from ui.config_panel import ConfigTab
 from ui.totp_tool import TotpToolTab
@@ -26,102 +36,119 @@ class PanelApp:
         self.config = config
         self.api    = ApiClient(config)
 
-        self.root = tk.Tk()
+        self.root = ctk.CTk()
         self.root.title("ATANA Agents — Panel")
         self.root.minsize(960, 720)
         self.root.geometry("1100x780")
 
         self._setup_style()
 
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True)
+        self.tabview = ctk.CTkTabview(self.root)
+        self.tabview.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.overview_tab = OverviewTab(self.notebook, self.api)
-        self.totp_tab     = TotpToolTab(self.notebook, self.api)
-        self.config_tab   = ConfigTab(self.notebook, self.api)
+        general_frame = self.tabview.add("📊  General")
+        totp_frame    = self.tabview.add("🔑  TOTP")
+        config_frame  = self.tabview.add("⚙️  Configuración")
 
-        self.notebook.add(self.overview_tab, text="  General  ")
-        self.notebook.add(self.totp_tab,     text="  TOTP  ")
-        self.notebook.add(self.config_tab,   text="  Configuración  ")
+        self.overview_tab = OverviewTab(general_frame, self.api)
+        self.overview_tab.pack(fill="both", expand=True)
+
+        self.totp_tab = TotpToolTab(totp_frame, self.api)
+        self.totp_tab.pack(fill="both", expand=True)
+
+        self.config_tab = ConfigTab(config_frame, self.api)
+        self.config_tab.pack(fill="both", expand=True)
 
         if open_config:
-            self.notebook.select(self.config_tab)
+            self.tabview.set("⚙️  Configuración")
 
     def _setup_style(self):
+        # The one widget that stays plain ttk (Treeview, in OverviewTab) needs
+        # its own restyle to match the dark CTk shell — "clam" is the only
+        # built-in ttk theme that actually honors explicit color overrides;
+        # native themes (vista/aqua) mostly ignore them and keep drawing a
+        # white table, which would look broken next to everything else here.
         style = ttk.Style()
-        available = style.theme_names()
-        if "aqua" in available:
-            style.theme_use("aqua")
-        elif "vista" in available:
-            style.theme_use("vista")
-        elif "clam" in available:
-            style.theme_use("clam")
+        style.theme_use("clam")
 
-        style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.configure(
+            "Treeview", background=theme.TABLE_BG, fieldbackground=theme.TABLE_BG,
+            foreground=theme.TEXT, rowheight=30, font=theme.FONT_BODY, borderwidth=0,
+        )
+        style.map("Treeview", background=[("selected", theme.PRIMARY)], foreground=[("selected", "white")])
+        style.configure(
+            "Treeview.Heading", background=theme.TABLE_HEADER_BG, foreground=theme.TEXT,
+            font=theme.FONT_BODY_B, borderwidth=0, relief="flat",
+        )
+        style.map("Treeview.Heading", background=[("active", theme.TABLE_HEADER_BG)])
 
     def run(self):
         self.overview_tab.start_auto_refresh()
         self.root.mainloop()
 
 
-class OverviewTab(ttk.Frame):
+class OverviewTab(ctk.CTkFrame):
     """Live agent status — port of the old ui/tui.py DashboardWindow, now
     reading everything from the local API instead of SQL Server directly."""
 
     def __init__(self, parent, api: ApiClient):
-        super().__init__(parent)
+        super().__init__(parent, fg_color="transparent")
         self.api = api
         self._selected_provider: str | None = None
+        self._refresh_after_id: str | None = None
         self._build_ui()
 
     # ── Layout ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        header = tk.Frame(self, bg="#1a1a2e", pady=8)
+        header = ctk.CTkFrame(self, fg_color=theme.SURFACE, corner_radius=0)
         header.pack(fill="x")
 
-        tk.Label(
-            header, text="ATANA Agents", font=("Segoe UI", 14, "bold"),
-            fg="white", bg="#1a1a2e",
-        ).pack(side="left", padx=16)
+        ctk.CTkLabel(
+            header, text="ATANA Agents", font=theme.FONT_H1, text_color="white",
+        ).pack(side="left", padx=16, pady=10)
 
-        tk.Button(
-            header, text="⟳  Refresh", font=("Segoe UI", 10),
-            bg="#2d2d5e", fg="white", relief="flat", cursor="hand2",
-            padx=12, pady=4, command=self._refresh,
-        ).pack(side="right", padx=12)
+        ctk.CTkButton(
+            header, text="⟳  Actualizar", font=theme.FONT_BODY, width=130,
+            fg_color=theme.SURFACE_ALT, hover_color=theme.NEUTRAL_HOVER, text_color="white",
+            command=self._refresh,
+        ).pack(side="right", padx=12, pady=8)
 
-        self.lbl_last = tk.Label(header, text="", font=("Segoe UI", 9), fg="#8888aa", bg="#1a1a2e")
+        self.lbl_last = ctk.CTkLabel(header, text="", font=theme.FONT_SMALL, text_color=theme.TEXT_DIM)
         self.lbl_last.pack(side="right", padx=4)
 
-        summary = tk.Frame(self, bg="#f0f0f0", pady=7, padx=16)
-        summary.pack(fill="x")
+        summary = ctk.CTkFrame(self, fg_color="transparent")
+        summary.pack(fill="x", padx=16, pady=8)
 
-        self.lbl_ok     = tk.Label(summary, text="✔  OK: 0",            fg="#2f9e44", bg="#f0f0f0", font=("Segoe UI", 10, "bold"))
-        self.lbl_interv = tk.Label(summary, text="⚠  Intervention: 0",  fg="#f08c00", bg="#f0f0f0", font=("Segoe UI", 10, "bold"))
-        self.lbl_err    = tk.Label(summary, text="✖  Error: 0",         fg="#e03131", bg="#f0f0f0", font=("Segoe UI", 10, "bold"))
-        self.lbl_run    = tk.Label(summary, text="",                    fg="#1971c2", bg="#f0f0f0", font=("Segoe UI", 10, "bold"))
+        self.lbl_ok     = ctk.CTkLabel(summary, text="✔  OK: 0",           text_color=theme.SUCCESS, font=theme.FONT_BODY_B)
+        self.lbl_interv = ctk.CTkLabel(summary, text="⚠  Intervención: 0", text_color=theme.WARNING, font=theme.FONT_BODY_B)
+        self.lbl_err    = ctk.CTkLabel(summary, text="✖  Error: 0",        text_color=theme.DANGER,  font=theme.FONT_BODY_B)
+        self.lbl_run    = ctk.CTkLabel(summary, text="",                   text_color=theme.PRIMARY, font=theme.FONT_BODY_B)
         for lbl in (self.lbl_ok, self.lbl_interv, self.lbl_err, self.lbl_run):
             lbl.pack(side="left", padx=14)
 
-        self.interv_outer = tk.Frame(self, bg="#fff3cd", bd=1, relief="solid")
+        self.interv_outer = ctk.CTkFrame(
+            self, fg_color=theme.CARD, corner_radius=8, border_width=1, border_color=theme.WARNING,
+        )
 
-        tk.Label(
-            self.interv_outer, text="⚠  Intervention required — click Play to authorize",
-            font=("Segoe UI", 11, "bold"), fg="#856404", bg="#fff3cd", pady=6, padx=12,
-        ).pack(fill="x", anchor="w")
+        ctk.CTkLabel(
+            self.interv_outer, text="⚠  Requiere intervención — presioná Autorizar para continuar",
+            font=theme.FONT_BODY_B, text_color=theme.WARNING, anchor="w",
+        ).pack(fill="x", padx=12, pady=(8, 4))
 
-        interv_canvas_frame = tk.Frame(self.interv_outer, bg="#fff3cd")
+        interv_canvas_frame = ctk.CTkFrame(self.interv_outer, fg_color="transparent")
         interv_canvas_frame.pack(fill="x", padx=8, pady=(0, 8))
 
-        self._interv_canvas = tk.Canvas(interv_canvas_frame, bg="#fff3cd", highlightthickness=0, bd=0)
-        interv_vsb = ttk.Scrollbar(interv_canvas_frame, orient="vertical", command=self._interv_canvas.yview)
+        self._interv_canvas = tk.Canvas(interv_canvas_frame, bg=theme.CARD, highlightthickness=0, bd=0)
+        interv_vsb = ctk.CTkScrollbar(interv_canvas_frame, orientation="vertical", command=self._interv_canvas.yview)
         self._interv_canvas.configure(yscrollcommand=interv_vsb.set)
         self._interv_canvas.pack(side="left", fill="x", expand=True)
         interv_vsb.pack(side="right", fill="y")
 
-        self.interv_rows = tk.Frame(self._interv_canvas, bg="#fff3cd")
+        # Plain tk.Frame (not CTkFrame) — this one lives embedded directly
+        # inside a raw tk.Canvas via create_window, an untested combination
+        # for a CTk widget; a plain Frame is the safe, known-good choice here.
+        self.interv_rows = tk.Frame(self._interv_canvas, bg=theme.CARD)
         self._interv_canvas_window = self._interv_canvas.create_window((0, 0), window=self.interv_rows, anchor="nw")
 
         self._interv_canvas.bind(
@@ -136,19 +163,19 @@ class OverviewTab(ttk.Frame):
             ),
         )
 
-        table_frame = tk.LabelFrame(self, text="Agent status", font=("Segoe UI", 10, "bold"), padx=4, pady=4)
+        table_frame = theme.TitledFrame(self, "Estado de agentes")
         table_frame.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
         cols = ("st", "agent", "result", "files", "last_run", "next_run", "ver")
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=9, selectmode="browse")
+        self.tree = ttk.Treeview(table_frame.body, columns=cols, show="headings", height=9, selectmode="browse")
 
         self.tree.heading("st",       text="")
-        self.tree.heading("agent",    text="Agent")
-        self.tree.heading("result",   text="Last result")
-        self.tree.heading("files",    text="Files today")
-        self.tree.heading("last_run", text="Last run")
-        self.tree.heading("next_run", text="Next run")
-        self.tree.heading("ver",      text="Version")
+        self.tree.heading("agent",    text="Agente")
+        self.tree.heading("result",   text="Último resultado")
+        self.tree.heading("files",    text="Archivos hoy")
+        self.tree.heading("last_run", text="Última corrida")
+        self.tree.heading("next_run", text="Próxima corrida")
+        self.tree.heading("ver",      text="Versión")
 
         self.tree.column("st",       width=30,  anchor="center", stretch=False)
         self.tree.column("agent",    width=130, anchor="w",      stretch=False)
@@ -158,50 +185,48 @@ class OverviewTab(ttk.Frame):
         self.tree.column("next_run", width=120, anchor="center", stretch=False)
         self.tree.column("ver",      width=80,  anchor="center", stretch=False)
 
-        self.tree.tag_configure("ok",           foreground="#2f9e44")
-        self.tree.tag_configure("error",        foreground="#e03131")
-        self.tree.tag_configure("running",      foreground="#1971c2")
-        self.tree.tag_configure("intervention", foreground="#f08c00")
-        self.tree.tag_configure("none",         foreground="#868e96")
+        self.tree.tag_configure("ok",           foreground=theme.SUCCESS)
+        self.tree.tag_configure("error",        foreground=theme.DANGER)
+        self.tree.tag_configure("running",      foreground=theme.PRIMARY)
+        self.tree.tag_configure("intervention", foreground=theme.WARNING)
+        self.tree.tag_configure("none",         foreground=theme.TEXT_DIM)
 
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        vsb = ctk.CTkScrollbar(table_frame.body, orientation="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_row_select)
 
-        actions = tk.Frame(self, pady=6, padx=12)
-        actions.pack(fill="x")
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=6)
 
-        self.lbl_selected = tk.Label(actions, text="No agent selected", font=("Segoe UI", 10), fg="#666666")
+        self.lbl_selected = ctk.CTkLabel(actions, text="Ningún agente seleccionado", font=theme.FONT_BODY, text_color=theme.TEXT_DIM)
         self.lbl_selected.pack(side="left")
 
-        self.btn_retry = tk.Button(
-            actions, text="↺  Retry selected", font=("Segoe UI", 10),
-            bg="#1971c2", fg="white", disabledforeground="#aaaaaa",
-            relief="flat", cursor="hand2", padx=12, pady=4,
+        self.btn_retry = ctk.CTkButton(
+            actions, text="↺  Reintentar seleccionado", font=theme.FONT_BODY, width=220,
+            fg_color=theme.PRIMARY, hover_color=theme.PRIMARY_HOVER, text_color_disabled=theme.TEXT_DIM_2,
             state="disabled", command=self._retry,
         )
         self.btn_retry.pack(side="right", padx=4)
 
-        log_frame = tk.LabelFrame(self, text="Recent events", font=("Segoe UI", 10, "bold"), padx=4, pady=4)
+        log_frame = theme.TitledFrame(self, "Eventos recientes")
         log_frame.pack(fill="x", padx=12, pady=(0, 12))
 
-        self.log_text = tk.Text(
-            log_frame, height=6, font=("Consolas", 9), state="disabled",
-            bg="#1e1e2e", fg="#cdd6f4", relief="flat", wrap="word",
-        )
-        log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_vsb.set)
+        self.log_text = ctk.CTkTextbox(log_frame.body, height=140, fg_color=theme.SURFACE, corner_radius=6)
+        self.log_text.pack(fill="x", expand=True)
 
-        self.log_text.tag_configure("info",    foreground="#89dceb")
-        self.log_text.tag_configure("warning", foreground="#f9e2af")
-        self.log_text.tag_configure("error",   foreground="#f38ba8")
-        self.log_text.tag_configure("success", foreground="#a6e3a1")
-        self.log_text.tag_configure("dim",     foreground="#6c7086")
-
-        self.log_text.pack(side="left", fill="x", expand=True)
-        log_vsb.pack(side="right", fill="y")
+        # The colored per-line tags (info/warning/error/...) need the raw
+        # tkinter.Text CTkTextbox wraps internally — CTkTextbox's own public
+        # API doesn't expose tag_configure. `_textbox` is the (informally
+        # documented, widely relied-on) attribute name for it.
+        self._log_inner = self.log_text._textbox
+        self._log_inner.configure(font=theme.FONT_MONO_BODY, fg=theme.TEXT_ON_DARK, bg=theme.SURFACE, state="disabled", wrap="word")
+        self._log_inner.tag_configure("info",    foreground="#89dceb")
+        self._log_inner.tag_configure("warning", foreground="#f9e2af")
+        self._log_inner.tag_configure("error",   foreground="#f38ba8")
+        self._log_inner.tag_configure("success", foreground="#a6e3a1")
+        self._log_inner.tag_configure("dim",     foreground="#6c7086")
 
         self._log(None, "info", "Panel iniciado")
 
@@ -221,7 +246,18 @@ class OverviewTab(ttk.Frame):
         one-off "<urlopen error ...>" that then worked fine a second later
         anyway. Always ends up rescheduling itself for the next cycle,
         success or not.
+
+        Cancels any already-pending auto-refresh timer first: this is also
+        wired to the "⟳ Actualizar" button, and without this a manual click
+        while the 30s auto-loop already has one scheduled used to leave BOTH
+        chains running — each one re-arming itself forever — so a few manual
+        refreshes over a session could quietly multiply into several
+        overlapping refresh cycles firing every 30s.
         """
+        if self._refresh_after_id is not None:
+            self.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+
         run_async_retrying(
             self,
             work=lambda: (self.api.get("/status"), self.api.get("/config/agents")),
@@ -229,9 +265,14 @@ class OverviewTab(ttk.Frame):
             on_final_error=self._on_refresh_error,
         )
 
+    def _schedule_next_refresh(self):
+        if self._refresh_after_id is not None:
+            self.after_cancel(self._refresh_after_id)
+        self._refresh_after_id = self.after(30_000, self._refresh)
+
     def _on_refresh_error(self, e: Exception):
         self._log(None, "error", f"No se pudo conectar con el dispatcher: {e}")
-        self.after(30_000, self._refresh)
+        self._schedule_next_refresh()
 
     def _apply_refresh(self, resp: tuple):
         status_resp, agents_resp = resp
@@ -259,11 +300,11 @@ class OverviewTab(ttk.Frame):
             self._update_intervention_rows(intervention_jobs, statuses_by_prov)
             self._update_table(statuses, int_providers)
 
-            self.lbl_last.config(text=f"Updated: {datetime.now().strftime('%H:%M:%S')}")
+            self.lbl_last.configure(text=f"Actualizado: {datetime.now().strftime('%H:%M:%S')}")
         except Exception as e:
             self._log(None, "error", f"Refresh error: {e}")
 
-        self.after(30_000, self._refresh)
+        self._schedule_next_refresh()
 
     def _update_summary(self, statuses: list, intervention_jobs: list):
         ok  = sum(1 for s in statuses if s.get("last_result") == "ok")
@@ -271,10 +312,10 @@ class OverviewTab(ttk.Frame):
         run = sum(1 for s in statuses if s.get("last_result") == "running")
         inv = len(intervention_jobs)
 
-        self.lbl_ok.config(text=f"✔  OK: {ok}")
-        self.lbl_interv.config(text=f"⚠  Intervention: {inv}")
-        self.lbl_err.config(text=f"✖  Error: {err}")
-        self.lbl_run.config(text=f"◉  Running: {run}" if run else "")
+        self.lbl_ok.configure(text=f"✔  OK: {ok}")
+        self.lbl_interv.configure(text=f"⚠  Intervención: {inv}")
+        self.lbl_err.configure(text=f"✖  Error: {err}")
+        self.lbl_run.configure(text=f"◉  Corriendo: {run}" if run else "")
 
     def _update_intervention_rows(self, jobs: list, statuses_by_provider: dict):
         for w in self.interv_rows.winfo_children():
@@ -294,51 +335,46 @@ class OverviewTab(ttk.Frame):
             files    = status.get("files_today", 0)
             last_err = status.get("last_error")
 
-            border = tk.Frame(self.interv_rows, bg="#f08c00")
-            border.pack(fill="x", pady=5)
-            card = tk.Frame(border, bg="white")
-            card.pack(fill="x", padx=2, pady=2)
-            tk.Frame(card, bg="#f08c00", width=6).pack(side="left", fill="y")
+            card = ctk.CTkFrame(self.interv_rows, fg_color=theme.CARD_WHITE, corner_radius=8, border_width=1, border_color=theme.WARNING)
+            card.pack(fill="x", pady=5)
 
-            tk.Label(card, text="⚠", font=("Segoe UI", 16), fg="#f08c00", bg="white", padx=8, pady=10).pack(side="left")
+            ctk.CTkLabel(card, text="⚠", font=(theme.FONT_FAMILY, 16), text_color=theme.WARNING).pack(side="left", padx=(12, 8), pady=10)
 
-            info = tk.Frame(card, bg="white")
+            info = ctk.CTkFrame(card, fg_color="transparent")
             info.pack(side="left", fill="x", expand=True, pady=8)
 
-            top_row = tk.Frame(info, bg="white")
+            top_row = ctk.CTkFrame(info, fg_color="transparent")
             top_row.pack(fill="x")
-            tk.Label(top_row, text=provider.upper(), font=("Segoe UI", 12, "bold"), fg="#1a1a2e", bg="white").pack(side="left")
-            tk.Label(
+            ctk.CTkLabel(top_row, text=provider.upper(), font=(theme.FONT_FAMILY, 12, "bold"), text_color=theme.TEXT).pack(side="left")
+            ctk.CTkLabel(
                 top_row, text=f"   Última ejecución: {last_run}   ·   Archivos hoy: {files}",
-                font=("Segoe UI", 9), fg="#999999", bg="white",
+                font=theme.FONT_SMALL, text_color=theme.TEXT_DIM,
             ).pack(side="left")
 
-            tk.Label(info, text=reason, font=("Segoe UI", 10), fg="#555555", bg="white", anchor="w").pack(fill="x")
+            ctk.CTkLabel(info, text=reason, font=theme.FONT_BODY, text_color=theme.TEXT, anchor="w").pack(fill="x")
 
             if last_err:
-                tk.Label(
+                ctk.CTkLabel(
                     info, text=f"Último error: {last_err[:90]}",
-                    font=("Segoe UI", 9), fg="#e03131", bg="white", anchor="w",
+                    font=theme.FONT_SMALL, text_color=theme.DANGER, anchor="w",
                 ).pack(fill="x")
 
-            btn_col = tk.Frame(card, bg="white")
+            btn_col = ctk.CTkFrame(card, fg_color="transparent")
             btn_col.pack(side="right", padx=14, pady=8)
 
-            play_btn = tk.Button(
-                btn_col, text="▶  Play", font=("Segoe UI", 11, "bold"),
-                bg="#f08c00", fg="white", relief="flat", cursor="hand2",
-                padx=20, pady=7, command=lambda p=provider: self._play(p),
-            )
-            play_btn.pack()
+            ctk.CTkButton(
+                btn_col, text="▶  Autorizar", font=(theme.FONT_FAMILY, 11, "bold"), width=140,
+                fg_color=theme.WARNING, hover_color=theme.WARNING_HOVER, text_color="white",
+                command=lambda p=provider: self._play(p),
+            ).pack()
 
-            tk.Frame(btn_col, height=4, bg="white").pack()
+            ctk.CTkFrame(btn_col, height=4, fg_color="transparent").pack()
 
-            ign_btn = tk.Button(
-                btn_col, text="✕  Ignore", font=("Segoe UI", 9),
-                bg="#eeeeee", fg="#555555", relief="flat", cursor="hand2",
-                padx=10, pady=4, command=lambda p=provider: self._ignore(p),
-            )
-            ign_btn.pack(fill="x")
+            ctk.CTkButton(
+                btn_col, text="✕  Ignorar", font=theme.FONT_SMALL, width=140,
+                fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT,
+                command=lambda p=provider: self._ignore(p),
+            ).pack(fill="x")
 
     def _update_table(self, statuses: list, int_providers: set):
         selected = self._selected_provider
@@ -377,8 +413,8 @@ class OverviewTab(ttk.Frame):
         sel = self.tree.selection()
         if sel:
             self._selected_provider = sel[0]
-            self.lbl_selected.config(text=f"Selected: {self._selected_provider.upper()}")
-            self.btn_retry.config(state="normal")
+            self.lbl_selected.configure(text=f"Seleccionado: {self._selected_provider.upper()}")
+            self.btn_retry.configure(state="normal")
 
     def _play(self, provider: str):
         try:
@@ -391,7 +427,7 @@ class OverviewTab(ttk.Frame):
                 if portal_url:
                     import webbrowser
                     webbrowser.open(portal_url)
-            self._log(provider, "info", "Play authorized")
+            self._log(provider, "info", "Autorizado")
         except ApiError as e:
             self._log(provider, "error", f"No se pudo autorizar: {e}")
         self._refresh()
@@ -423,7 +459,7 @@ class OverviewTab(ttk.Frame):
     def _ignore(self, provider: str):
         try:
             self.api.post(f"/jobs/{provider}/ignore")
-            self._log(provider, "warning", "Job ignored")
+            self._log(provider, "warning", "Job ignorado")
         except ApiError as e:
             self._log(provider, "error", f"No se pudo ignorar: {e}")
         self._refresh()
@@ -434,7 +470,7 @@ class OverviewTab(ttk.Frame):
         provider = self._selected_provider
         try:
             self.api.post(f"/jobs/{provider}", {"started_by": "manual"})
-            self._log(provider, "info", "Job queued for retry")
+            self._log(provider, "info", "Reintento encolado")
         except ApiError as e:
             self._log(provider, "error", f"No se pudo reintentar: {e}")
         self._refresh()
@@ -445,25 +481,25 @@ class OverviewTab(ttk.Frame):
         time_str = datetime.now().strftime("%H:%M:%S")
         tag_str  = f"[{provider.upper()}]" if provider else "[SYSTEM]"
 
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", f"{time_str}  ", "dim")
-        self.log_text.insert("end", f"{tag_str:<14}", level)
-        self.log_text.insert("end", f"  {message}\n")
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
+        self._log_inner.configure(state="normal")
+        self._log_inner.insert("end", f"{time_str}  ", "dim")
+        self._log_inner.insert("end", f"{tag_str:<14}", level)
+        self._log_inner.insert("end", f"  {message}\n")
+        self._log_inner.see("end")
+        self._log_inner.configure(state="disabled")
         logger.log(level.upper() if level in ("info", "warning", "error") else "DEBUG", f"{tag_str} {message}")
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _fmt_result(self, result: str, error: str = None, files: int = 0) -> str:
         if result == "ok":
-            suffix = f"  ({files} files)" if files else ""
+            suffix = f"  ({files} archivos)" if files else ""
             return f"OK{suffix}"
         if result == "error":                 return f"Error: {(error or '')[:40]}"
-        if result == "running":               return "Running..."
-        if result == "requires_intervention": return "⚠ Intervention required"
-        if result == "ignored":               return "Ignored"
-        return "Not run"
+        if result == "running":               return "Corriendo..."
+        if result == "requires_intervention": return "⚠ Requiere intervención"
+        if result == "ignored":               return "Ignorado"
+        return "Sin ejecutar"
 
     def _fmt_date(self, dt) -> str:
         if not dt:

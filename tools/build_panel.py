@@ -65,11 +65,19 @@ def main():
         "--hidden-import", "ui.config_panel",
         "--hidden-import", "ui.totp_tool",
         "--hidden-import", "ui.async_utils",
+        "--hidden-import", "ui.theme",
         "--hidden-import", "shared.api_client",
         "--hidden-import", "shared.totp_extractor",
         "--hidden-import", "shared.paths",
 
         # tkinter is bundled with Python — no hidden import needed
+
+        # customtkinter ships its widget theme as .json files + font files
+        # that PyInstaller's import scanner can't see (they're loaded via
+        # importlib.resources / plain file paths, not import statements) —
+        # --collect-all is the documented fix; without it the packaged exe
+        # crashes on startup looking for its theme.
+        "--collect-all", "customtkinter",
 
         "--hidden-import", "loguru",
 

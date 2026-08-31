@@ -17,6 +17,7 @@ apscheduler>=3.10.0
 pystray>=0.19.0
 Pillow>=10.0.0
 textual>=0.50.0
+customtkinter>=5.2.0  # panel (ui/panel_app.py, ui/config_panel.py, ui/totp_tool.py)
 
 # Config y seguridad
 pydantic-settings>=2.0.0
