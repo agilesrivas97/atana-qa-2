@@ -170,15 +170,11 @@ class OverviewTab(ctk.CTkFrame):
         for lbl in (self.lbl_ok, self.lbl_interv, self.lbl_err, self.lbl_run):
             lbl.pack(side="left", padx=14)
 
-        # "Próximas corridas" y el banner de intervención de más abajo NO se
-        # empaquetan acá — arrancan ocultos y _apply_refresh() los muestra
-        # (con .pack(before=self.table_frame, ...)) solo cuando hay algo que
-        # mostrar. self.table_frame se crea y empaqueta primero, más abajo,
-        # así siempre existe como referencia estable para el 'before='.
-        self.upcoming_frame = theme.TitledFrame(self, "Próximas corridas")
-        self.upcoming_list = ctk.CTkFrame(self.upcoming_frame.body, fg_color="transparent")
-        self.upcoming_list.pack(fill="x")
-
+        # El banner de intervención de más abajo NO se empaqueta acá — arranca
+        # oculto y _apply_refresh() lo muestra (con .pack(before=self.table_frame))
+        # solo cuando hay algo que mostrar. self.table_frame se crea y
+        # empaqueta primero, más abajo, así siempre existe como referencia
+        # estable para el 'before='.
         self.interv_outer = ctk.CTkFrame(
             self, fg_color=theme.CARD, corner_radius=8, border_width=1, border_color=theme.WARNING,
         )
@@ -234,7 +230,7 @@ class OverviewTab(ctk.CTkFrame):
         self.tree.column("result",   width=290, anchor="w")
         self.tree.column("files",    width=100, anchor="center", stretch=False)
         self.tree.column("last_run", width=135, anchor="center", stretch=False)
-        self.tree.column("next_run", width=135, anchor="center", stretch=False)
+        self.tree.column("next_run", width=230, anchor="center", stretch=False)
         self.tree.column("ver",      width=90,  anchor="center", stretch=False)
 
         self.tree.tag_configure("ok",           foreground=theme.SUCCESS)
@@ -351,7 +347,6 @@ class OverviewTab(ctk.CTkFrame):
                     s["next_run"] = next_dt.isoformat()
 
             self._update_summary(statuses, intervention_jobs)
-            self._update_upcoming(statuses)
             self._update_intervention_rows(intervention_jobs, statuses_by_prov)
             self._update_table(statuses, int_providers)
 
@@ -372,45 +367,6 @@ class OverviewTab(ctk.CTkFrame):
         self.lbl_interv.configure(text=f"⚠  Intervención: {inv}")
         self.lbl_err.configure(text=f"✖  Error: {err}")
         self.lbl_run.configure(text=f"◉  Corriendo: {run}" if run else "")
-
-    def _update_upcoming(self, statuses: list):
-        """
-        'Próximas corridas' — qué agente va a correr y cuándo, ordenado por
-        lo más próximo primero. El dato (next_run) ya se calculaba antes,
-        pero vivía escondido en una columna más de la tabla grande; acá se
-        muestra aparte, arriba, con cuenta regresiva.
-        """
-        for w in self.upcoming_list.winfo_children():
-            w.destroy()
-
-        upcoming = []
-        for s in statuses:
-            next_run = s.get("next_run")
-            if not next_run:
-                continue
-            try:
-                next_dt = datetime.fromisoformat(next_run)
-            except Exception:
-                continue
-            upcoming.append((next_dt, s.get("provider", "")))
-        upcoming.sort(key=lambda t: t[0])
-
-        self.upcoming_frame.pack_forget()
-        if not upcoming:
-            return
-        self.upcoming_frame.pack(fill="x", padx=12, pady=(0, 8), before=self.table_frame)
-
-        for next_dt, provider in upcoming:
-            chip = ctk.CTkFrame(self.upcoming_list, fg_color=theme.NEUTRAL, corner_radius=8)
-            chip.pack(side="left", padx=(0, 8), pady=4)
-
-            ctk.CTkLabel(
-                chip, text=f"📅 {provider.upper()}", font=theme.FONT_BODY_B, text_color=theme.TEXT,
-            ).pack(side="left", padx=(10, 6), pady=6)
-            ctk.CTkLabel(
-                chip, text=f"{self._fmt_countdown(next_dt)} · {next_dt.strftime('%H:%M')}",
-                font=theme.FONT_SMALL, text_color=theme.TEXT_DIM,
-            ).pack(side="left", padx=(0, 10), pady=6)
 
     def _fmt_countdown(self, next_dt: datetime) -> str:
         delta_min = int((next_dt - datetime.now()).total_seconds() // 60)
@@ -502,7 +458,7 @@ class OverviewTab(ctk.CTkFrame):
                     self._fmt_result(result, s.get("last_error"), s.get("files_today", 0)),
                     s.get("files_today", 0),
                     self._fmt_date(s.get("last_run")),
-                    self._fmt_date(s.get("next_run")),
+                    self._fmt_next_run(s.get("next_run")),
                     s.get("current_version", "—"),
                 ),
                 tags=(TAGS.get(result, "none"),),
@@ -637,3 +593,16 @@ class OverviewTab(ctk.CTkFrame):
             except Exception:
                 return str(dt)[:16]
         return dt.strftime("%d/%m %H:%M")
+
+    def _fmt_next_run(self, dt) -> str:
+        """Igual que _fmt_date, pero con la cuenta regresiva al lado — antes
+        vivía en una sección aparte ('Próximas corridas'); ahora es directo
+        parte de esta misma columna, no hace falta un listado nuevo."""
+        if not dt:
+            return "—"
+        if isinstance(dt, str):
+            try:
+                dt = datetime.fromisoformat(dt)
+            except Exception:
+                return str(dt)[:16]
+        return f"{dt.strftime('%d/%m %H:%M')} · {self._fmt_countdown(dt)}"

@@ -404,14 +404,43 @@ class GeneralSettingsTab(_SettingsTabBase):
         self._op_status.configure(text="Reiniciando...", text_color=theme.PRIMARY)
 
         def _on_done(_):
-            self._op_spinner.stop()
-            self._op_status.configure(text="Reiniciando... puede tardar ~15-20s en volver.", text_color=theme.PRIMARY)
+            # El POST ya volvió — el dispatcher todavía está vivo un instante
+            # (hace os._exit recién ~1s después). A partir de acá hay que
+            # esperar a que efectivamente se caiga y NSSM lo vuelva a levantar,
+            # y confirmarlo, en vez de dejar "reiniciando" tildado para
+            # siempre sin que el panel avise nada más.
+            self._op_status.configure(text="Reiniciando... esperando que vuelva.", text_color=theme.PRIMARY)
+            self.after(3000, lambda: self._poll_restart(attempt=1))
 
         def _on_error(e):
             self._op_spinner.stop()
             self._op_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
 
         run_async(self, work=lambda: self.api.post("/service/restart"), on_done=_on_done, on_error=_on_error)
+
+    def _poll_restart(self, attempt: int, max_attempts: int = 30):
+        """
+        Reintenta GET /status cada 2s hasta que el dispatcher responda de
+        nuevo (mientras se reinicia, el puerto de la API local está
+        directamente caído — cada intento en el medio falla con un error de
+        conexión normal, no es un problema real). ~1 minuto de margen total
+        antes de avisar que algo salió mal en vez de quedarse esperando para
+        siempre.
+        """
+        def _on_done(_):
+            self._op_spinner.stop()
+            self._op_status.configure(text="Servicio reiniciado ✔", text_color=theme.SUCCESS)
+
+        def _on_error(_e):
+            if attempt >= max_attempts:
+                self._op_spinner.stop()
+                self._op_status.configure(
+                    text="El servicio no respondió — revisá logs\\service.log.", text_color=theme.DANGER,
+                )
+                return
+            self.after(2000, lambda: self._poll_restart(attempt + 1, max_attempts))
+
+        run_async(self, work=lambda: self.api.get("/status"), on_done=_on_done, on_error=_on_error)
 
     def _build_security_section(self):
         row = self._row + 1
