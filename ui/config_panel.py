@@ -150,8 +150,26 @@ def _scrollable(tab_frame) -> ctk.CTkScrollableFrame:
     AgentConfigTab, etc.) doesn't need to know about this — it's built
     exactly as before, just with this as its parent instead of the raw
     tabview page.
+
+    A diferencia del Treeview y la lista de intervenciones (ver
+    theme.autohide_scrollbar), CTkScrollableFrame no expone su scrollbar
+    interno de forma pública — no hay forma limpia de esconderlo del todo
+    cuando el contenido entra sin tocar internals de la librería. En cambio,
+    se lo pinta del mismo color que el fondo real del tab: en reposo no se
+    nota, y al pasar el mouse se resalta apenas (scrollbar_button_hover_color)
+    para que siga siendo descubrible.
     """
-    container = ctk.CTkScrollableFrame(tab_frame, fg_color="transparent")
+    bg = theme.resolve_color(tab_frame, tab_frame.cget("fg_color"))
+    try:
+        container = ctk.CTkScrollableFrame(
+            tab_frame, fg_color="transparent",
+            scrollbar_fg_color=bg, scrollbar_button_color=bg,
+            scrollbar_button_hover_color=theme.BORDER,
+        )
+    except TypeError:
+        # customtkinter viejo sin estos parámetros — se pierde el blend,
+        # pero el tab sigue funcionando con el scrollbar por defecto.
+        container = ctk.CTkScrollableFrame(tab_frame, fg_color="transparent")
     container.pack(fill="both", expand=True)
     return container
 

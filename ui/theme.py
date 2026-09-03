@@ -130,3 +130,60 @@ class Spinner(ctk.CTkLabel):
     def stop(self):
         self._running = False
         self.configure(text="")
+
+
+def resolve_color(widget, color) -> str:
+    """
+    Resuelve un color de CTk (puede venir como tupla (claro, oscuro) o como
+    un string ya fijo) al hex real que se está pintando ahora mismo, según
+    el modo de apariencia activo. Usa el helper interno que CTk ya usa en
+    todos lados para esto mismo (`_apply_appearance_mode`); si en alguna
+    versión futura ese nombre cambiara, se cae de vuelta a NEUTRAL en vez de
+    romper — solo afecta un detalle cosmético (blend del scrollbar).
+    """
+    try:
+        return widget._apply_appearance_mode(color)
+    except Exception:
+        return NEUTRAL
+
+
+def autohide_scrollbar(scrollbar, orientation: str = "vertical"):
+    """
+    Devuelve un callback de yscrollcommand/xscrollcommand que hace aparecer
+    `scrollbar` solo cuando el contenido no entra entero en la vista, y lo
+    esconde (pack_forget) apenas vuelve a entrar — el patrón clásico de
+    "autoscrollbar" de Tkinter, adaptado a pack() en vez de grid() porque así
+    están armados estos layouts.
+
+    Sirve para cualquier widget que hable el protocolo estándar de scroll
+    (Treeview, Canvas, Text, Listbox: todos llaman a este callback con
+    (first, last) — las fracciones visibles — cada vez que cambia la vista
+    o el contenido). Uso:
+
+        vsb = ctk.CTkScrollbar(parent, orientation="vertical", command=widget.yview)
+        widget.configure(yscrollcommand=theme.autohide_scrollbar(vsb))
+        widget.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")   # visible al arrancar; el primer
+                                            # callback ya decide si corresponde
+
+    No usar esto para CTkScrollableFrame — ese scrollbar vive gridded dentro
+    del propio widget (no accesible sin tocar sus internals), así que ahí la
+    opción es pintarlo del color del fondo en vez de esconderlo (ver
+    ui/config_panel.py:_scrollable).
+    """
+    vertical = orientation == "vertical"
+    pack_kwargs = {"side": "right", "fill": "y"} if vertical else {"side": "bottom", "fill": "x"}
+    state = {"visible": True}
+
+    def _set(first, last):
+        first, last = float(first), float(last)
+        needed = first > 0.0005 or last < 0.9995
+        if needed and not state["visible"]:
+            scrollbar.pack(**pack_kwargs)
+            state["visible"] = True
+        elif not needed and state["visible"]:
+            scrollbar.pack_forget()
+            state["visible"] = False
+        scrollbar.set(first, last)
+
+    return _set

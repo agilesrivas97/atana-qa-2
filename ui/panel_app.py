@@ -56,7 +56,18 @@ class PanelApp:
         # Scrollable: la tarjeta de TOTP (secreto + códigos + "guardar en un
         # agente") puede terminar más alta que la ventana, sobre todo si se
         # achica — sin esto, lo que no entra simplemente desaparece.
-        totp_scroll = ctk.CTkScrollableFrame(totp_frame, fg_color="transparent")
+        # El scrollbar se pinta del color real del tab (no hay forma limpia
+        # de esconderlo del todo en CTkScrollableFrame — ver
+        # ui/config_panel.py:_scrollable) para que no se note en reposo.
+        totp_bg = theme.resolve_color(totp_frame, totp_frame.cget("fg_color"))
+        try:
+            totp_scroll = ctk.CTkScrollableFrame(
+                totp_frame, fg_color="transparent",
+                scrollbar_fg_color=totp_bg, scrollbar_button_color=totp_bg,
+                scrollbar_button_hover_color=theme.BORDER,
+            )
+        except TypeError:
+            totp_scroll = ctk.CTkScrollableFrame(totp_frame, fg_color="transparent")
         totp_scroll.pack(fill="both", expand=True)
         self.totp_tab = TotpToolTab(totp_scroll, self.api)
         self.totp_tab.pack(fill="both", expand=True)
@@ -189,7 +200,10 @@ class OverviewTab(ctk.CTkFrame):
 
         self._interv_canvas = tk.Canvas(interv_canvas_frame, bg=theme.CARD, highlightthickness=0, bd=0)
         interv_vsb = ctk.CTkScrollbar(interv_canvas_frame, orientation="vertical", command=self._interv_canvas.yview)
-        self._interv_canvas.configure(yscrollcommand=interv_vsb.set)
+        # Aparece solo si hay más intervenciones pendientes de las que entran
+        # en los 220px de alto máxima (ver el bind de <Configure> más abajo);
+        # con una o dos, que es lo normal, no hace falta scroll y no se ve.
+        self._interv_canvas.configure(yscrollcommand=theme.autohide_scrollbar(interv_vsb))
         self._interv_canvas.pack(side="left", fill="x", expand=True)
         interv_vsb.pack(side="right", fill="y")
 
@@ -240,7 +254,10 @@ class OverviewTab(ctk.CTkFrame):
         self.tree.tag_configure("none",         foreground=theme.TEXT_DIM)
 
         vsb = ctk.CTkScrollbar(self.table_frame.body, orientation="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        # Con 9 filas visibles (height=9 arriba) y normalmente pocos agentes
+        # configurados, la mayoría de las veces entran todos y no hace falta
+        # scroll — aparece solo cuando de verdad hay más agentes que filas.
+        self.tree.configure(yscrollcommand=theme.autohide_scrollbar(vsb))
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_row_select)
