@@ -15,19 +15,31 @@ dialogs — correct to leave unskinned). See ui/theme.py for the palette and
 the TitledFrame helper that stands in for the tk.LabelFrame this used to use.
 """
 
+import re
 import tkinter as tk
 from tkinter import messagebox, ttk
 from datetime import datetime
+from pathlib import Path
 
 import customtkinter as ctk
 from loguru import logger
 
 from shared.api_client import ApiClient
-from shared.paths import BASE_DIR as _BASE_DIR
+from shared.paths import BASE_DIR as _BASE_DIR, LOGS_DIR
 from ui import theme
 from ui.async_utils import run_async, run_async_retrying
 from ui.config_panel import ConfigTab
 from ui.totp_tool import TotpToolTab
+
+# Parsea las líneas del archivo de log del dispatcher (formato fijado en
+# dispatcher/main.py:setup_logging — "{time} | {level} | {name}:{line} | {msg}")
+# para poder mostrarlas en "Eventos recientes" — ver OverviewTab._poll_dispatcher_log.
+_DLOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| (\w+)\s*\| [\w.]+:\d+ \| (.*)$")
+_DLOG_TAG_RE  = re.compile(r"^\[(\w+)\]\s*(.*)$")
+# DEBUG queda afuera a propósito — es puro ruido de heartbeat (ticks del
+# scheduler, "No pending jobs", cuerpos de respuesta HTTP completos, etc.);
+# mostrar eso en un cuadro de 140px lo volvería ilegible en minutos.
+_DLOG_LEVEL_TAGS = {"INFO": "info", "WARNING": "warning", "ERROR": "error", "CRITICAL": "error", "SUCCESS": "success"}
 
 
 class PanelApp:
@@ -294,6 +306,9 @@ class OverviewTab(ctk.CTkFrame):
         self._log_inner.tag_configure("dim",     foreground="#6c7086")
 
         self._log(None, "info", "Panel iniciado")
+        self._dlog_path: Path | None = None
+        self._dlog_pos  = 0
+        self._start_dispatcher_log_tail()
 
     # ── Data refresh ───────────────────────────────────────────────────────
 
@@ -588,6 +603,77 @@ class OverviewTab(ctk.CTkFrame):
         self._log_inner.see("end")
         self._log_inner.configure(state="disabled")
         logger.log(level.upper() if level in ("info", "warning", "error") else "DEBUG", f"{tag_str} {message}")
+
+    # ── Eventos del dispatcher (lee el log, no agrega ningún endpoint) ──────
+    #
+    # "Eventos recientes" hasta acá solo mostraba lo que el USUARIO hacía
+    # desde el panel (autorizar, ignorar, reintentar) — nada de lo que el
+    # dispatcher hace solo (corridas de agentes, chequeos de autoupdate,
+    # reinicios de servicio). En vez de sumarle un endpoint nuevo a
+    # dispatcher/api.py para exponer esto, se lee directo el mismo archivo
+    # de log que dispatcher/main.py:setup_logging() ya escribe — panel y
+    # dispatcher siempre viven en la misma carpeta de instalación (ver
+    # tools/build_panel.py), así que shared.paths.LOGS_DIR ya apunta al
+    # lugar correcto sin configurar nada nuevo.
+
+    def _dispatcher_log_path(self) -> Path | None:
+        try:
+            files = sorted(LOGS_DIR.glob("dispatcher_*.log"))
+            return files[-1] if files else None
+        except Exception:
+            return None
+
+    def _start_dispatcher_log_tail(self):
+        # Arranca posicionado al FINAL del archivo de hoy — no vuelca el
+        # log del día entero al abrir el panel, solo lo que se agregue de
+        # ahí en más.
+        path = self._dispatcher_log_path()
+        self._dlog_path = path
+        try:
+            self._dlog_pos = path.stat().st_size if path else 0
+        except Exception:
+            self._dlog_pos = 0
+        self.after(4000, self._poll_dispatcher_log)
+
+    def _poll_dispatcher_log(self):
+        run_async(
+            self, work=self._read_new_dispatcher_log_lines,
+            on_done=self._apply_dispatcher_log_lines,
+            on_error=lambda e: self.after(4000, self._poll_dispatcher_log),
+        )
+
+    def _read_new_dispatcher_log_lines(self) -> list[str]:
+        """Corre en background thread (run_async) — es I/O de archivo."""
+        path = self._dispatcher_log_path()
+        if path is None:
+            return []
+        if path != self._dlog_path:
+            # Rotó a un archivo nuevo (cambio de día, medianoche) — arranca
+            # desde el principio del archivo nuevo.
+            self._dlog_path = path
+            self._dlog_pos  = 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._dlog_pos)
+                lines = f.readlines()
+                self._dlog_pos = f.tell()
+            return lines
+        except Exception:
+            return []
+
+    def _apply_dispatcher_log_lines(self, lines: list[str]):
+        for raw in lines:
+            m = _DLOG_LINE_RE.match(raw.rstrip("\n"))
+            if not m:
+                continue  # línea de continuación (traceback, etc.) — se ignora
+            level_str, message = m.groups()
+            tag = _DLOG_LEVEL_TAGS.get(level_str.strip())
+            if tag is None:
+                continue  # DEBUG u otro nivel no mapeado — filtrado a propósito
+            tm = _DLOG_TAG_RE.match(message)
+            provider, msg = (tm.group(1), tm.group(2)) if tm else (None, message)
+            self._log(provider, tag, msg)
+        self.after(4000, self._poll_dispatcher_log)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
