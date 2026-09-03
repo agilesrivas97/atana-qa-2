@@ -22,6 +22,13 @@ Flujo:
         para que NSSM no reinicie con el exe viejo antes de que el swap ocurra
      e. Lanza el script PS en background y hace os._exit(0)
      f. El script PS restaura AppExit = restart y arranca el servicio nuevo
+  5. Antes de aplicar (d), intenta actualizar tambien atana_panel.exe si la
+     release lo incluye (ver _update_panel_exe) — best-effort: el panel no es
+     un servicio, nadie depende de que este corriendo, asi que si falla
+     (tipicamente porque esta abierto en ese momento) simplemente se reintenta
+     en el proximo chequeo — nunca aborta ni pone en riesgo el update del
+     dispatcher, que es el que de verdad importa para que el servicio siga
+     funcionando.
 
 Configuracion en system_config (BD):
   github_token               -> Personal Access Token (repo:read)
@@ -114,6 +121,26 @@ def _cleanup_old_exe():
                 )
 
 
+def _cleanup_old_panel_exe():
+    """
+    Deletes atana_panel.exe.old left by a previous panel update — same idea
+    as _cleanup_old_exe(), but lower-stakes: the panel isn't a service
+    nothing depends on, so if it's still locked (someone has it open right
+    now) this just quietly does nothing and tries again on the next check —
+    no retry loop needed here, unlike the dispatcher's own cleanup.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    old_panel = Path(sys.executable).parent / "atana_panel.exe.old"
+    if not old_panel.exists():
+        return
+    try:
+        old_panel.unlink()
+        logger.info(f"[autoupdater] Eliminado backup anterior del panel: {old_panel.name}")
+    except Exception as e:
+        logger.debug(f"[autoupdater] No se pudo eliminar {old_panel.name} (probablemente sigue abierto): {e}")
+
+
 # ── Version comparison ────────────────────────────────────────────────────────
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -152,6 +179,118 @@ def _headers(token: str) -> dict:
     }
 
 
+# ── Panel exe (best-effort, independent from the dispatcher's own update) ──────
+
+def _update_panel_exe(cfg: dict, release: dict, install_dir: Path):
+    """
+    Swaps atana_panel.exe if the release includes it (see tools/build_panel.py
+    for panel_build_info.json / .github/workflows/build.yml for the release
+    upload). Same download+SHA256-verify+rename pattern as the dispatcher's
+    own update, but nothing here is allowed to raise: this is called from
+    inside the dispatcher's update flow, and a locked panel exe (someone has
+    it open right now) is the expected common case, not an error — it just
+    gets picked up on the next check.
+
+    The rename-not-delete swap works even while the panel is open: Windows
+    lets you rename a file that's currently in use (the running process keeps
+    using its already-open handle under the old name), it just can't be
+    deleted/overwritten in place. No need to kill it first like the
+    dispatcher does with itself — the panel isn't a service, nothing needs it
+    to restart immediately, the new exe just takes effect next time someone
+    opens it.
+    """
+    panel_path = install_dir / "atana_panel.exe"
+    if not panel_path.exists():
+        return  # instalación vieja sin el panel como exe separado
+
+    assets = release.get("assets", [])
+    asset = next((a for a in assets if a["name"] == "atana_panel.exe"), None)
+    build_info_asset = next((a for a in assets if a["name"] == "panel_build_info.json"), None)
+    if not asset or not build_info_asset:
+        logger.debug("[autoupdater] Release sin atana_panel.exe/panel_build_info.json — panel no actualizado")
+        return
+
+    tmp_exe = install_dir / "atana_panel.new"
+    try:
+        dl_headers = dict(_headers(cfg["token"]))
+        dl_headers["Accept"] = "application/octet-stream"
+
+        with httpx.Client(timeout=60, follow_redirects=True) as client:
+            bi_url = (
+                f"https://api.github.com/repos/{cfg['owner']}/{cfg['repo']}"
+                f"/releases/assets/{build_info_asset['id']}"
+            )
+            bi_resp = client.get(bi_url, headers=dl_headers)
+            bi_resp.raise_for_status()
+            build_info = bi_resp.json()
+
+        expected_sha256 = build_info.get("sha256", "")
+        if not expected_sha256:
+            logger.warning("[autoupdater] panel_build_info.json sin sha256 — panel no actualizado")
+            return
+
+        tmp_exe.unlink(missing_ok=True)
+        asset_url = (
+            f"https://api.github.com/repos/{cfg['owner']}/{cfg['repo']}"
+            f"/releases/assets/{asset['id']}"
+        )
+        logger.info(f"[autoupdater] Descargando atana_panel.exe ({asset['size']:,} bytes)...")
+        with httpx.Client(timeout=300, follow_redirects=True) as client:
+            with client.stream("GET", asset_url, headers=dl_headers) as r:
+                r.raise_for_status()
+                tmp_exe.write_bytes(r.read())
+
+        sha = hashlib.sha256()
+        with open(tmp_exe, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha.update(chunk)
+        actual_sha256 = sha.hexdigest()
+
+        if actual_sha256 != expected_sha256:
+            tmp_exe.unlink(missing_ok=True)
+            logger.error(
+                f"[autoupdater] SHA256 del panel no coincide — descarga descartada\n"
+                f"  esperado: {expected_sha256}\n  obtenido: {actual_sha256}"
+            )
+            return
+
+        logger.success(f"[autoupdater] Descarga del panel verificada — {tmp_exe.stat().st_size:,} bytes, SHA256 OK")
+
+        old_panel = install_dir / "atana_panel.exe.old"
+        old_panel.unlink(missing_ok=True)  # best-effort — si sigue ahí de una vuelta anterior no es grave
+
+        try:
+            os.rename(panel_path, old_panel)
+        except Exception as e:
+            logger.warning(f"[autoupdater] atana_panel.exe está en uso — se reintenta en el próximo chequeo: {e}")
+            tmp_exe.unlink(missing_ok=True)
+            # Único rastro que queda de todo esto del lado del dispatcher: una
+            # fila más en system_config, leída por el mecanismo que YA existe
+            # (GET /config/system -> get_system_config_masked(), sin agregar
+            # ningún endpoint nuevo) — el panel, si está abierto, la ve y
+            # avisa al usuario. Se limpia sola en cuanto el swap se logre.
+            db.set_system_config("pending_panel_update", release.get("tag_name", ""))
+            return
+
+        try:
+            os.rename(tmp_exe, panel_path)
+        except Exception as e:
+            logger.error(f"[autoupdater] Falló el swap de atana_panel.exe, revirtiendo: {e}")
+            try:
+                os.rename(old_panel, panel_path)
+            except Exception:
+                pass
+            return
+
+        db.set_system_config("pending_panel_update", "")
+        logger.success("[autoupdater] atana_panel.exe actualizado")
+
+    except Exception as e:
+        logger.warning(f"[autoupdater] No se pudo actualizar atana_panel.exe (se reintenta en el próximo chequeo): {e}")
+        try:
+            tmp_exe.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 
@@ -170,6 +309,7 @@ def check_for_update():
     # This must run before any early return so that a just-updated process (which is
     # now 'up to date') still removes the leftover backup on its first call.
     _cleanup_old_exe()
+    _cleanup_old_panel_exe()
 
     cfg = _github_config()
     if not cfg:
@@ -297,6 +437,11 @@ def check_for_update():
         logger.success(
             f"[autoupdater] Download verified — {tmp_exe.stat().st_size:,} bytes, SHA256 OK"
         )
+
+        # Best-effort, antes del swap+restart del dispatcher: si falla (panel
+        # abierto en este momento, release vieja sin el asset, etc.) no debe
+        # afectar en nada lo que sigue — ver _update_panel_exe.
+        _update_panel_exe(cfg, release, exe_path.parent)
 
         logger.info("[autoupdater] Applying update via Windows rename pattern...")
         _kill_other_instances()

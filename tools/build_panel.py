@@ -14,9 +14,11 @@ Salida: dist/exe/atana_panel.exe (mismo dist/exe que build/build.py, para
 """
 
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT     = Path(__file__).parent.parent
@@ -104,6 +106,18 @@ def main():
 
     size   = exe.stat().st_size
     sha256 = _sha256(exe)
+
+    # Publicado junto al exe en la release de GitHub (ver .github/workflows/
+    # build.yml) — dispatcher/autoupdater.py lo usa para verificar la
+    # integridad de atana_panel.exe antes de reemplazarlo, igual que ya
+    # hace con build_info.json para atana_dispatcher.exe.
+    build_info = {
+        "sha256":     sha256,
+        "size":       size,
+        "built_at":   datetime.now().isoformat(),
+        "executable": exe.name,
+    }
+    (DIST_DIR / "panel_build_info.json").write_text(json.dumps(build_info, indent=2))
 
     print(f"\n{'=' * 55}")
     print(f"  Build exitoso")

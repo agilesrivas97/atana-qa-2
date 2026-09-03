@@ -100,6 +100,7 @@ jobs:
             dist/exe/atana_panel.exe
             dist/exe/atana_restart_tray.exe
             dist/exe/build_info.json
+            dist/exe/panel_build_info.json
             installer/Output/AtanaAgents_Setup_v*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

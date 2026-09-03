@@ -16,16 +16,16 @@ the TitledFrame helper that stands in for the tk.LabelFrame this used to use.
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from datetime import datetime
 
 import customtkinter as ctk
 from loguru import logger
 
-from shared.api_client import ApiClient, ApiError
+from shared.api_client import ApiClient
 from shared.paths import BASE_DIR as _BASE_DIR
 from ui import theme
-from ui.async_utils import run_async_retrying
+from ui.async_utils import run_async, run_async_retrying
 from ui.config_panel import ConfigTab
 from ui.totp_tool import TotpToolTab
 
@@ -53,7 +53,12 @@ class PanelApp:
         self.overview_tab = OverviewTab(general_frame, self.api)
         self.overview_tab.pack(fill="both", expand=True)
 
-        self.totp_tab = TotpToolTab(totp_frame, self.api)
+        # Scrollable: la tarjeta de TOTP (secreto + códigos + "guardar en un
+        # agente") puede terminar más alta que la ventana, sobre todo si se
+        # achica — sin esto, lo que no entra simplemente desaparece.
+        totp_scroll = ctk.CTkScrollableFrame(totp_frame, fg_color="transparent")
+        totp_scroll.pack(fill="both", expand=True)
+        self.totp_tab = TotpToolTab(totp_scroll, self.api)
         self.totp_tab.pack(fill="both", expand=True)
 
         self.config_tab = ConfigTab(config_frame, self.api)
@@ -61,6 +66,37 @@ class PanelApp:
 
         if open_config:
             self.tabview.set("⚙️  Configuración")
+
+        self._pending_update_shown: str | None = None
+
+    def _check_pending_update(self):
+        """
+        Avisa "cerrame para actualizarme" solo mientras el panel está
+        efectivamente abierto — no hay nada persistido del lado del panel,
+        es simplemente este .after() corriendo mientras la ventana exista.
+
+        El dato (system_config.pending_panel_update) lo escribe
+        dispatcher/autoupdater.py cuando intenta reemplazar atana_panel.exe
+        y lo encuentra en uso — se lee acá vía GET /config/system, que ya
+        existía para la pestaña Configuración; no hay ningún endpoint nuevo
+        del lado del dispatcher.
+        """
+        def _on_done(resp):
+            version = (resp.get("system", {}) or {}).get("pending_panel_update", "")
+            if version and version != self._pending_update_shown:
+                self._pending_update_shown = version
+                messagebox.showwarning(
+                    "Actualización del panel",
+                    f"Hay una actualización nueva del panel ({version}) esperando para instalarse.\n\n"
+                    "Cerrá esta ventana para que se aplique sola en el próximo chequeo automático.",
+                    parent=self.root,
+                )
+            self.root.after(120_000, self._check_pending_update)
+
+        def _on_error(_e):
+            self.root.after(120_000, self._check_pending_update)
+
+        run_async(self.root, work=lambda: self.api.get("/config/system"), on_done=_on_done, on_error=_on_error)
 
     def _setup_style(self):
         # The one widget that stays plain ttk (Treeview, in OverviewTab) needs
@@ -73,17 +109,18 @@ class PanelApp:
 
         style.configure(
             "Treeview", background=theme.TABLE_BG, fieldbackground=theme.TABLE_BG,
-            foreground=theme.TEXT, rowheight=30, font=theme.FONT_BODY, borderwidth=0,
+            foreground=theme.TEXT, rowheight=38, font=theme.FONT_TABLE, borderwidth=0,
         )
         style.map("Treeview", background=[("selected", theme.PRIMARY)], foreground=[("selected", "white")])
         style.configure(
             "Treeview.Heading", background=theme.TABLE_HEADER_BG, foreground=theme.TEXT,
-            font=theme.FONT_BODY_B, borderwidth=0, relief="flat",
+            font=theme.FONT_TABLE_H, borderwidth=0, relief="flat",
         )
         style.map("Treeview.Heading", background=[("active", theme.TABLE_HEADER_BG)])
 
     def run(self):
         self.overview_tab.start_auto_refresh()
+        self.root.after(5000, self._check_pending_update)
         self.root.mainloop()
 
 
@@ -114,7 +151,13 @@ class OverviewTab(ctk.CTkFrame):
             command=self._refresh,
         ).pack(side="right", padx=12, pady=8)
 
-        self.lbl_last = ctk.CTkLabel(header, text="", font=theme.FONT_SMALL, text_color=theme.TEXT_DIM)
+        self._refresh_spinner = theme.Spinner(header, text_color="white")
+        self._refresh_spinner.pack(side="right", padx=(4, 0))
+
+        # theme.TEXT_ON_DARK, no theme.TEXT_DIM — this label sits on the dark
+        # header bar, the one deliberately-dark surface where the default
+        # (dark-on-light) muted text color would be nearly unreadable.
+        self.lbl_last = ctk.CTkLabel(header, text="", font=theme.FONT_SMALL, text_color=theme.TEXT_ON_DARK)
         self.lbl_last.pack(side="right", padx=4)
 
         summary = ctk.CTkFrame(self, fg_color="transparent")
@@ -126,6 +169,15 @@ class OverviewTab(ctk.CTkFrame):
         self.lbl_run    = ctk.CTkLabel(summary, text="",                   text_color=theme.PRIMARY, font=theme.FONT_BODY_B)
         for lbl in (self.lbl_ok, self.lbl_interv, self.lbl_err, self.lbl_run):
             lbl.pack(side="left", padx=14)
+
+        # "Próximas corridas" y el banner de intervención de más abajo NO se
+        # empaquetan acá — arrancan ocultos y _apply_refresh() los muestra
+        # (con .pack(before=self.table_frame, ...)) solo cuando hay algo que
+        # mostrar. self.table_frame se crea y empaqueta primero, más abajo,
+        # así siempre existe como referencia estable para el 'before='.
+        self.upcoming_frame = theme.TitledFrame(self, "Próximas corridas")
+        self.upcoming_list = ctk.CTkFrame(self.upcoming_frame.body, fg_color="transparent")
+        self.upcoming_list.pack(fill="x")
 
         self.interv_outer = ctk.CTkFrame(
             self, fg_color=theme.CARD, corner_radius=8, border_width=1, border_color=theme.WARNING,
@@ -163,11 +215,11 @@ class OverviewTab(ctk.CTkFrame):
             ),
         )
 
-        table_frame = theme.TitledFrame(self, "Estado de agentes")
-        table_frame.pack(fill="both", expand=True, padx=12, pady=(8, 4))
+        self.table_frame = theme.TitledFrame(self, "Estado de agentes")
+        self.table_frame.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
         cols = ("st", "agent", "result", "files", "last_run", "next_run", "ver")
-        self.tree = ttk.Treeview(table_frame.body, columns=cols, show="headings", height=9, selectmode="browse")
+        self.tree = ttk.Treeview(self.table_frame.body, columns=cols, show="headings", height=9, selectmode="browse")
 
         self.tree.heading("st",       text="")
         self.tree.heading("agent",    text="Agente")
@@ -177,13 +229,13 @@ class OverviewTab(ctk.CTkFrame):
         self.tree.heading("next_run", text="Próxima corrida")
         self.tree.heading("ver",      text="Versión")
 
-        self.tree.column("st",       width=30,  anchor="center", stretch=False)
-        self.tree.column("agent",    width=130, anchor="w",      stretch=False)
-        self.tree.column("result",   width=260, anchor="w")
-        self.tree.column("files",    width=90,  anchor="center", stretch=False)
-        self.tree.column("last_run", width=120, anchor="center", stretch=False)
-        self.tree.column("next_run", width=120, anchor="center", stretch=False)
-        self.tree.column("ver",      width=80,  anchor="center", stretch=False)
+        self.tree.column("st",       width=36,  anchor="center", stretch=False)
+        self.tree.column("agent",    width=150, anchor="w",      stretch=False)
+        self.tree.column("result",   width=290, anchor="w")
+        self.tree.column("files",    width=100, anchor="center", stretch=False)
+        self.tree.column("last_run", width=135, anchor="center", stretch=False)
+        self.tree.column("next_run", width=135, anchor="center", stretch=False)
+        self.tree.column("ver",      width=90,  anchor="center", stretch=False)
 
         self.tree.tag_configure("ok",           foreground=theme.SUCCESS)
         self.tree.tag_configure("error",        foreground=theme.DANGER)
@@ -191,7 +243,7 @@ class OverviewTab(ctk.CTkFrame):
         self.tree.tag_configure("intervention", foreground=theme.WARNING)
         self.tree.tag_configure("none",         foreground=theme.TEXT_DIM)
 
-        vsb = ctk.CTkScrollbar(table_frame.body, orientation="vertical", command=self.tree.yview)
+        vsb = ctk.CTkScrollbar(self.table_frame.body, orientation="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -258,6 +310,7 @@ class OverviewTab(ctk.CTkFrame):
             self.after_cancel(self._refresh_after_id)
             self._refresh_after_id = None
 
+        self._refresh_spinner.start()
         run_async_retrying(
             self,
             work=lambda: (self.api.get("/status"), self.api.get("/config/agents")),
@@ -271,6 +324,7 @@ class OverviewTab(ctk.CTkFrame):
         self._refresh_after_id = self.after(30_000, self._refresh)
 
     def _on_refresh_error(self, e: Exception):
+        self._refresh_spinner.stop()
         self._log(None, "error", f"No se pudo conectar con el dispatcher: {e}")
         self._schedule_next_refresh()
 
@@ -297,6 +351,7 @@ class OverviewTab(ctk.CTkFrame):
                     s["next_run"] = next_dt.isoformat()
 
             self._update_summary(statuses, intervention_jobs)
+            self._update_upcoming(statuses)
             self._update_intervention_rows(intervention_jobs, statuses_by_prov)
             self._update_table(statuses, int_providers)
 
@@ -304,6 +359,7 @@ class OverviewTab(ctk.CTkFrame):
         except Exception as e:
             self._log(None, "error", f"Refresh error: {e}")
 
+        self._refresh_spinner.stop()
         self._schedule_next_refresh()
 
     def _update_summary(self, statuses: list, intervention_jobs: list):
@@ -317,6 +373,54 @@ class OverviewTab(ctk.CTkFrame):
         self.lbl_err.configure(text=f"✖  Error: {err}")
         self.lbl_run.configure(text=f"◉  Corriendo: {run}" if run else "")
 
+    def _update_upcoming(self, statuses: list):
+        """
+        'Próximas corridas' — qué agente va a correr y cuándo, ordenado por
+        lo más próximo primero. El dato (next_run) ya se calculaba antes,
+        pero vivía escondido en una columna más de la tabla grande; acá se
+        muestra aparte, arriba, con cuenta regresiva.
+        """
+        for w in self.upcoming_list.winfo_children():
+            w.destroy()
+
+        upcoming = []
+        for s in statuses:
+            next_run = s.get("next_run")
+            if not next_run:
+                continue
+            try:
+                next_dt = datetime.fromisoformat(next_run)
+            except Exception:
+                continue
+            upcoming.append((next_dt, s.get("provider", "")))
+        upcoming.sort(key=lambda t: t[0])
+
+        self.upcoming_frame.pack_forget()
+        if not upcoming:
+            return
+        self.upcoming_frame.pack(fill="x", padx=12, pady=(0, 8), before=self.table_frame)
+
+        for next_dt, provider in upcoming:
+            chip = ctk.CTkFrame(self.upcoming_list, fg_color=theme.NEUTRAL, corner_radius=8)
+            chip.pack(side="left", padx=(0, 8), pady=4)
+
+            ctk.CTkLabel(
+                chip, text=f"📅 {provider.upper()}", font=theme.FONT_BODY_B, text_color=theme.TEXT,
+            ).pack(side="left", padx=(10, 6), pady=6)
+            ctk.CTkLabel(
+                chip, text=f"{self._fmt_countdown(next_dt)} · {next_dt.strftime('%H:%M')}",
+                font=theme.FONT_SMALL, text_color=theme.TEXT_DIM,
+            ).pack(side="left", padx=(0, 10), pady=6)
+
+    def _fmt_countdown(self, next_dt: datetime) -> str:
+        delta_min = int((next_dt - datetime.now()).total_seconds() // 60)
+        if delta_min < 1:
+            return "en instantes"
+        hours, minutes = divmod(delta_min, 60)
+        if hours > 0:
+            return f"en {hours}h {minutes}min" if minutes else f"en {hours}h"
+        return f"en {minutes} min"
+
     def _update_intervention_rows(self, jobs: list, statuses_by_provider: dict):
         for w in self.interv_rows.winfo_children():
             w.destroy()
@@ -325,7 +429,7 @@ class OverviewTab(ctk.CTkFrame):
             self.interv_outer.pack_forget()
             return
 
-        self.interv_outer.pack(fill="x", padx=12, pady=(8, 0))
+        self.interv_outer.pack(fill="x", padx=12, pady=(8, 0), before=self.table_frame)
 
         for job in jobs:
             provider = job["provider"]
@@ -417,20 +521,33 @@ class OverviewTab(ctk.CTkFrame):
             self.btn_retry.configure(state="normal")
 
     def _play(self, provider: str):
-        try:
-            if provider == "fiserv":
-                self._launch_capture(provider)
-            else:
-                self.api.post(f"/jobs/{provider}/play")
-                cfg = self.api.get(f"/config/agents/{provider}")
-                portal_url = cfg.get("portal_url")
-                if portal_url:
-                    import webbrowser
-                    webbrowser.open(portal_url)
+        # Async, no llamada directa al POST+GET: hacerlo en el hilo principal
+        # congelaba la ventana mientras esperaba respuesta — mismo problema
+        # que ya se arregló en ui/config_panel.py para 'Guardar todo' y
+        # 'Reiniciar servicio'.
+        if provider == "fiserv":
+            self._launch_capture(provider)
             self._log(provider, "info", "Autorizado")
-        except ApiError as e:
+            self._refresh()
+            return
+
+        def _do():
+            self.api.post(f"/jobs/{provider}/play")
+            return self.api.get(f"/config/agents/{provider}")
+
+        def _on_done(cfg):
+            portal_url = cfg.get("portal_url")
+            if portal_url:
+                import webbrowser
+                webbrowser.open(portal_url)
+            self._log(provider, "info", "Autorizado")
+            self._refresh()
+
+        def _on_error(e):
             self._log(provider, "error", f"No se pudo autorizar: {e}")
-        self._refresh()
+            self._refresh()
+
+        run_async(self, work=_do, on_done=_on_done, on_error=_on_error)
 
     def _launch_capture(self, provider: str):
         """
@@ -457,23 +574,33 @@ class OverviewTab(ctk.CTkFrame):
             self._log(provider, "error", f"No se pudo lanzar la captura de sesión: {e}")
 
     def _ignore(self, provider: str):
-        try:
-            self.api.post(f"/jobs/{provider}/ignore")
+        def _on_done(_):
             self._log(provider, "warning", "Job ignorado")
-        except ApiError as e:
+            self._refresh()
+
+        def _on_error(e):
             self._log(provider, "error", f"No se pudo ignorar: {e}")
-        self._refresh()
+            self._refresh()
+
+        run_async(self, work=lambda: self.api.post(f"/jobs/{provider}/ignore"), on_done=_on_done, on_error=_on_error)
 
     def _retry(self):
         if not self._selected_provider:
             return
         provider = self._selected_provider
-        try:
-            self.api.post(f"/jobs/{provider}", {"started_by": "manual"})
+
+        def _on_done(_):
             self._log(provider, "info", "Reintento encolado")
-        except ApiError as e:
+            self._refresh()
+
+        def _on_error(e):
             self._log(provider, "error", f"No se pudo reintentar: {e}")
-        self._refresh()
+            self._refresh()
+
+        run_async(
+            self, work=lambda: self.api.post(f"/jobs/{provider}", {"started_by": "manual"}),
+            on_done=_on_done, on_error=_on_error,
+        )
 
     # ── Log ────────────────────────────────────────────────────────────────
 

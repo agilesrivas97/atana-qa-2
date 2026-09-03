@@ -140,6 +140,22 @@ def _agent_tab_sort_key(agent: dict):
     return (priority, provider)
 
 
+def _scrollable(tab_frame) -> ctk.CTkScrollableFrame:
+    """
+    Wraps a CTkTabview page in a scrollable container — a tab's form
+    (CREDENCIALES + otras cosas, or the Operación/Seguridad boxes in
+    General) can end up taller than the window, especially if the panel
+    gets resized down; without this, whatever doesn't fit is just gone,
+    with no way to reach it. The tab's own content class (GeneralSettingsTab,
+    AgentConfigTab, etc.) doesn't need to know about this — it's built
+    exactly as before, just with this as its parent instead of the raw
+    tabview page.
+    """
+    container = ctk.CTkScrollableFrame(tab_frame, fg_color="transparent")
+    container.pack(fill="both", expand=True)
+    return container
+
+
 # ── Small reusable dialogs ──────────────────────────────────────────────────
 
 def _confirm(parent, title: str, message: str) -> bool:
@@ -366,8 +382,11 @@ class GeneralSettingsTab(_SettingsTabBase):
             command=self._restart_service,
         ).grid(row=1, column=0, sticky="w", padx=10)
 
+        self._op_spinner = theme.Spinner(op.body)
+        self._op_spinner.grid(row=1, column=1, sticky="w", padx=(6, 0))
+
         self._op_status = ctk.CTkLabel(op.body, text="", font=theme.FONT_SMALL)
-        self._op_status.grid(row=2, column=0, sticky="w", padx=10, pady=(8, 0))
+        self._op_status.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0))
 
     def _restart_service(self):
         if not _confirm(
@@ -377,11 +396,22 @@ class GeneralSettingsTab(_SettingsTabBase):
             "tardar unos segundos en volver a responder.\n\n¿Continuar?",
         ):
             return
-        try:
-            self.api.post("/service/restart")
+
+        # Async, no llamada directa: un POST hecho en el hilo principal
+        # congela toda la ventana mientras espera respuesta — el mismo
+        # problema que ya se arregló para "Guardar todo" (ver _save_all).
+        self._op_spinner.start()
+        self._op_status.configure(text="Reiniciando...", text_color=theme.PRIMARY)
+
+        def _on_done(_):
+            self._op_spinner.stop()
             self._op_status.configure(text="Reiniciando... puede tardar ~15-20s en volver.", text_color=theme.PRIMARY)
-        except ApiError as e:
+
+        def _on_error(e):
+            self._op_spinner.stop()
             self._op_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
+
+        run_async(self, work=lambda: self.api.post("/service/restart"), on_done=_on_done, on_error=_on_error)
 
     def _build_security_section(self):
         row = self._row + 1
@@ -406,20 +436,31 @@ class GeneralSettingsTab(_SettingsTabBase):
             command=self._rotate_master,
         ).grid(row=1, column=1, sticky="w")
 
+        self._sec_spinner = theme.Spinner(sec.body)
+        self._sec_spinner.grid(row=1, column=2, sticky="w", padx=(6, 0))
+
         self._sec_status = ctk.CTkLabel(sec.body, text="", font=theme.FONT_SMALL)
-        self._sec_status.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0))
+        self._sec_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 0))
 
     def _rotate_api_key(self):
         if not _confirm(self, "Regenerar API key",
                          "Esto invalida la API key actual. El tray y el panel se actualizan solos "
                          "en su próxima recarga (≤30s). ¿Continuar?"):
             return
-        try:
-            resp = self.api.post("/config/keys/rotate-api-key")
+
+        self._sec_spinner.start()
+        self._sec_status.configure(text="Regenerando...", text_color=theme.PRIMARY)
+
+        def _on_done(resp):
+            self._sec_spinner.stop()
             self.api.api_key = resp.get("api_key", self.api.api_key)
             self._sec_status.configure(text="API key regenerada ✔", text_color=theme.SUCCESS)
-        except ApiError as e:
+
+        def _on_error(e):
+            self._sec_spinner.stop()
             self._sec_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
+
+        run_async(self, work=lambda: self.api.post("/config/keys/rotate-api-key"), on_done=_on_done, on_error=_on_error)
 
     def _rotate_master(self):
         if not _confirm(
@@ -429,18 +470,31 @@ class GeneralSettingsTab(_SettingsTabBase):
             "No cierres el panel hasta que termine. ¿Continuar?",
         ):
             return
-        try:
-            self.api.post("/config/keys/rotate-master", {"targets": ["fernet_key", "session_key"]})
-        except ApiError as e:
+
+        self._sec_spinner.start()
+        self._sec_status.configure(text="Iniciando rotación...", text_color=theme.PRIMARY)
+
+        def _on_done(_):
+            self._sec_status.configure(text="Rotando...", text_color=theme.PRIMARY)
+            self.after(1500, self._poll_rotation)
+
+        def _on_error(e):
+            self._sec_spinner.stop()
             messagebox.showerror("ATANA", f"No se pudo iniciar la rotación: {e}", parent=self)
-            return
-        self._sec_status.configure(text="Rotando...", text_color=theme.PRIMARY)
-        self.after(1500, self._poll_rotation)
+
+        run_async(
+            self, work=lambda: self.api.post("/config/keys/rotate-master", {"targets": ["fernet_key", "session_key"]}),
+            on_done=_on_done, on_error=_on_error,
+        )
 
     def _poll_rotation(self):
+        # Se queda en el hilo principal a propósito: es solo una lectura de
+        # un dict en memoria del lado del servidor (sin ida y vuelta a SQL
+        # Server), responde casi al instante — no vale la pena el async acá.
         try:
             status = self.api.get("/config/keys/rotate-status")
         except ApiError as e:
+            self._sec_spinner.stop()
             self._sec_status.configure(text=f"Error consultando estado: {e}", text_color=theme.DANGER)
             return
 
@@ -448,10 +502,13 @@ class GeneralSettingsTab(_SettingsTabBase):
         if state == "running":
             self.after(1500, self._poll_rotation)
         elif state == "done":
+            self._sec_spinner.stop()
             self._sec_status.configure(text="Rotación completada ✔", text_color=theme.SUCCESS)
         elif state == "error":
+            self._sec_spinner.stop()
             self._sec_status.configure(text=f"Falló — claves anteriores siguen vigentes: {status.get('detail')}", text_color=theme.DANGER)
         else:
+            self._sec_spinner.stop()
             self._sec_status.configure(text="")
 
 
@@ -904,6 +961,9 @@ class ConfigTab(ctk.CTkFrame):
         self._global_status = ctk.CTkLabel(footer, text="", font=theme.FONT_SMALL)
         self._global_status.pack(side="right", padx=12)
 
+        self._save_spinner = theme.Spinner(footer)
+        self._save_spinner.pack(side="right")
+
         ctk.CTkButton(
             footer, text="💾 Guardar todo", width=170, font=_FIELD_FONT,
             fg_color=theme.PRIMARY, hover_color=theme.PRIMARY_HOVER,
@@ -921,11 +981,11 @@ class ConfigTab(ctk.CTkFrame):
         self._agents_tab_key = "🤖  Agentes"
         agents_frame = self.tabview.add(self._agents_tab_key)
 
-        self.general_tab = GeneralSettingsTab(general_frame, api)
+        self.general_tab = GeneralSettingsTab(_scrollable(general_frame), api)
         self.general_tab.pack(fill="both", expand=True)
-        self.smtp_tab = SmtpSettingsTab(smtp_frame, api)
+        self.smtp_tab = SmtpSettingsTab(_scrollable(smtp_frame), api)
         self.smtp_tab.pack(fill="both", expand=True)
-        self.update_tab = AutoUpdateSettingsTab(update_frame, api)
+        self.update_tab = AutoUpdateSettingsTab(_scrollable(update_frame), api)
         self.update_tab.pack(fill="both", expand=True)
         self._savable_tabs += [self.general_tab, self.smtp_tab, self.update_tab]
 
@@ -965,9 +1025,11 @@ class ConfigTab(ctk.CTkFrame):
             icon = _AGENT_TAB_ICONS.get(provider, "🤖" if available else "🚧")
             tab_frame = self.tabview.add(f"{icon}  {provider.capitalize()}")
             if available:
-                tab = AgentConfigTab(tab_frame, self.api, provider, agent)
+                tab = AgentConfigTab(_scrollable(tab_frame), self.api, provider, agent)
                 self._savable_tabs.append(tab)
             else:
+                # Sin scroll acá — es solo un mensaje centrado con .place(),
+                # nunca necesita más espacio del que ya tiene.
                 tab = _UnavailableAgentTab(tab_frame, provider)
             tab.pack(fill="both", expand=True)
 
@@ -995,6 +1057,7 @@ class ConfigTab(ctk.CTkFrame):
             return
 
         self._global_status.configure(text="Guardando...", text_color=theme.PRIMARY)
+        self._save_spinner.start()
 
         def _send_all():
             results = []
@@ -1006,13 +1069,18 @@ class ConfigTab(ctk.CTkFrame):
                     results.append((job["tab"], False, str(e)))
             return results
 
+        def _on_error(e):
+            self._save_spinner.stop()
+            self._global_status.configure(text=f"Error: {e}", text_color=theme.DANGER)
+
         run_async(
             self, work=_send_all,
             on_done=self._on_save_all_done,
-            on_error=lambda e: self._global_status.configure(text=f"Error: {e}", text_color=theme.DANGER),
+            on_error=_on_error,
         )
 
     def _on_save_all_done(self, results: list):
+        self._save_spinner.stop()
         ok_count = 0
         failed: list[str] = []
         for tab, ok, detail in results:

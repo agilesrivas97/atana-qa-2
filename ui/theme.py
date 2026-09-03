@@ -44,7 +44,10 @@ TABLE_BG       = "#ffffff"   # the (kept-ttk) Treeview's own background
 TABLE_HEADER_BG = "#f1f3f5"
 CARD           = "#fff3cd"   # intervention alert banner — standard light "warning" tint
 CARD_WHITE     = "#ffffff"   # individual alert row card, against the CARD-tinted banner
-BORDER         = "#dcdfe3"
+# A clear step darker than both the page background and a card's own fill —
+# the previous value (#dcdfe3) sat too close to both and the box outlines
+# were nearly invisible.
+BORDER         = "#9aa1a8"
 
 # ── Typography ──────────────────────────────────────────────────────────────
 FONT_FAMILY   = "Segoe UI"
@@ -58,6 +61,8 @@ FONT_BODY_B   = (FONT_FAMILY, 10, "bold")
 FONT_SMALL    = (FONT_FAMILY, 9)
 FONT_MONO_BODY = (FONT_MONO, 10)
 FONT_ICON     = (FONT_FAMILY, 14)   # icon-only buttons (📁, 💾, ✕) — bigger than body text
+FONT_TABLE    = (FONT_FAMILY, 12)         # Treeview rows (ui/panel_app.py) — was 10, too small to read
+FONT_TABLE_H  = (FONT_FAMILY, 12, "bold")  # Treeview column headings
 
 
 class TitledFrame(ctk.CTkFrame):
@@ -84,3 +89,44 @@ class TitledFrame(ctk.CTkFrame):
         )
         self.body = ctk.CTkFrame(self, fg_color="transparent")
         self.body.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+
+
+class Spinner(ctk.CTkLabel):
+    """
+    Small "esto está procesando" indicator — a spinning glyph that appears
+    only while .start() is active, and disappears on .stop(). Meant to sit
+    right next to a status label (Guardando..., Rotando..., etc.) so an
+    action that takes a moment has something visibly moving, not just text
+    that might go unnoticed.
+
+    Plain CTkLabel + .after(), not CTkProgressBar — no width/layout to
+    manage, and it reads fine as either "a quick blip" (one-shot PUT) or "a
+    sustained wait" (polling an actual server-side job) depending on how
+    long .start() stays active before .stop() is called.
+    """
+
+    _FRAMES = ["◐", "◓", "◑", "◒"]
+
+    def __init__(self, parent, **kwargs):
+        kwargs.setdefault("font", (FONT_FAMILY, 13))
+        kwargs.setdefault("text_color", PRIMARY)
+        super().__init__(parent, text="", width=18, **kwargs)
+        self._running = False
+        self._frame = 0
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._tick()
+
+    def _tick(self):
+        if not self._running:
+            return
+        self.configure(text=self._FRAMES[self._frame % len(self._FRAMES)])
+        self._frame += 1
+        self.after(150, self._tick)
+
+    def stop(self):
+        self._running = False
+        self.configure(text="")

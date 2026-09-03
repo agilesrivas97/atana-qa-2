@@ -344,8 +344,9 @@ class SetupApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("ATANA Agentes - Configuracion inicial")
-        self.root.geometry("520x530")
-        self.root.resizable(False, False)
+        self.root.geometry("560x560")
+        self.root.minsize(480, 360)
+        self.root.resizable(True, True)
 
         self._conn_vars: dict[str, tk.StringVar] = {}
         self._conn_entries: dict[str, ttk.Widget] = {}
@@ -373,8 +374,39 @@ class SetupApp:
             ))
 
     def _build_ui(self):
-        self._main = ttk.Frame(self.root, padding=24)
-        self._main.pack(fill="both", expand=True)
+        # Canvas + Scrollbar en vez de empaquetar self._main directo en la
+        # ventana: con 5 campos + separadores + checkbox + botones + log, el
+        # contenido puede terminar mas alto que la ventana (por DPI/escalado
+        # de Windows, tamano de fuente, etc.) y sin esto lo que no entra
+        # simplemente queda cortado — el checkbox de "Autenticacion Windows"
+        # (fila 8 de 13) y todo lo que sigue, en particular.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self._main = ttk.Frame(canvas, padding=24)
+        main_window = canvas.create_window((0, 0), window=self._main, anchor="nw")
+
+        self._main.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfig(main_window, width=e.width),
+        )
+        # Standalone window (nada mas corre en este proceso) — bind_all para
+        # la rueda del mouse es seguro acá, no hay otras ventanas con las que
+        # pueda chocar.
+        canvas.bind_all(
+            "<MouseWheel>",
+            lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
+        )
 
         ttk.Label(self._main, text="Configuracion inicial de base de datos",
                   font=("Segoe UI", 11, "bold")).grid(
