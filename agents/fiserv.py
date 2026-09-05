@@ -91,6 +91,17 @@ RECAPTCHA_SITE_KEY = "6LdQlQ0pAAAAADjbxloDIchjMWSdfO5H3l6Lnvzi"
 # trocea el rango en ventanas de este tamaño para evitar perder archivos sin darse cuenta.
 MAX_RANGE_DAYS = 25
 
+# /api/Users/authenticate devuelve el JWT de sesión en el body — _pw_post()
+# loguea un preview de CADA respuesta a nivel DEBUG (útil para diagnosticar
+# fallos de login/API), y ese sink queda escrito en el archivo de log 30 días
+# aunque debug esté apagado en consola. Sin esto, el token de sesión real
+# terminaba legible ahí — se redacta antes de loguear, nunca antes de usarse.
+_JWT_RE = _re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+
+
+def _redact_for_log(text: str) -> str:
+    return _JWT_RE.sub("<jwt-redactado>", text)
+
 
 class FiservAgent(AgentBase):
 
@@ -446,7 +457,7 @@ class FiservAgent(AgentBase):
             raise RuntimeError(f"[fiserv][pw] fetch falló: {result['fetchError']}")
         status = result["status"]
         text   = result["text"]
-        logger.debug(f"[{self.name}] POST {url} → status={status} body={text[:300]}")
+        logger.debug(f"[{self.name}] POST {url} → status={status} body={_redact_for_log(text[:300])}")
         if status not in (200, 201):
             error_preview = text[:200].replace('\n', ' ').replace('\r', '')
             raise RuntimeError(f"[fiserv][pw] HTTP {status}: {error_preview}")

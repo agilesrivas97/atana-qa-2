@@ -43,6 +43,20 @@ _fiserv_agente = None
 # Timestamp of the last successful update check — used to throttle GitHub calls.
 _last_update_check: datetime | None = None
 
+# Última versión logueada por cada "clave" pasada a _log_if_changed() — evita
+# relogear la misma info idéntica en cada tick de process_jobs (cada 60s,
+# para siempre): scheduler debug, "próxima ejecución programada", "ya
+# ejecutado hoy", cuenta regresiva del próximo chequeo de update. Todo eso
+# antes se repetía sin cambiar una coma, inflando el log sin aportar nada.
+_last_logged_state: dict = {}
+
+
+def _log_if_changed(key: str, value, log_fn):
+    if _last_logged_state.get(key) == value:
+        return
+    _last_logged_state[key] = value
+    log_fn()
+
 # Signals that Playwright Chromium is installed and ready.
 # process_jobs() waits on this before executing any agent.
 _chromium_ready = threading.Event()
@@ -288,7 +302,11 @@ def _check_update_if_due(force: bool = False):
         autoupdater.check_for_update()
     else:
         remaining = interval_hours * 3600 - (now - _last_update_check).total_seconds()
-        logger.debug(f"[updater] Next update check in {remaining/3600:.1f}h")
+        remaining_h = round(remaining / 3600, 1)
+        _log_if_changed(
+            "updater:remaining_h", remaining_h,
+            lambda: logger.debug(f"[updater] Next update check in {remaining_h}h"),
+        )
 
 # ── Scheduler helpers ─────────────────────────────────────────────────────────
 
@@ -330,10 +348,11 @@ def _debug_scheduler_jobs():
                     if not next_run and hasattr(job, "trigger"):
                         next_run = job.trigger.get_next_fire_time(None, datetime.now().astimezone())
 
-                    logger.debug(
-                        f"[SCHEDULER] id={job.id} "
-                        f"next_run={next_run} "
-                        f"trigger={job.trigger}"
+                    _log_if_changed(
+                        f"scheduler:{job.id}", (next_run, str(job.trigger)),
+                        lambda j=job, nr=next_run: logger.debug(
+                            f"[SCHEDULER] id={j.id} next_run={nr} trigger={j.trigger}"
+                        ),
                     )
 
                 except Exception as inner:
@@ -373,7 +392,10 @@ def _sync_scheduler_jobs():
 
             next_run = trigger.get_next_fire_time(None, now)
 
-            logger.debug(f"[{provider}] Proxima ejecucion programada: {next_run}")
+            _log_if_changed(
+                f"schedule:{provider}:next_run", next_run,
+                lambda p=provider, nr=next_run: logger.debug(f"[{p}] Proxima ejecucion programada: {nr}"),
+            )
 
             run_now = False
 
@@ -383,7 +405,10 @@ def _sync_scheduler_jobs():
                     logger.info(f"[{provider}] Hora ya pasó hoy — ejecución inmediata")
                     run_now = True
                 else:
-                    logger.info(f"[{provider}] Ya ejecutado hoy — skip ejecución inmediata")
+                    _log_if_changed(
+                        f"schedule:{provider}:skip_today", now.date().isoformat(),
+                        lambda p=provider: logger.info(f"[{p}] Ya ejecutado hoy — skip ejecución inmediata"),
+                    )
 
             if scheduler.get_job(job_id) is None:
                 scheduler.add_job(
@@ -435,6 +460,16 @@ def _register_tray_task() -> bool:
         cause of "the tray dies and won't come back" whenever it had been
         (re)launched through this fallback path instead of the old HKCU\\Run
         key.
+      - The principal's -GroupId is the raw SID 'S-1-5-32-545' (BUILTIN\\
+        Users), not the literal name — Register-ScheduledTask resolves a
+        name through an account-name lookup that only understands the
+        machine's *current UI language*, so 'BUILTIN\\Users' fails with
+        "no se efectuó ninguna asignación..." (ERROR_NONE_MAPPED /
+        0x80070534) on a Spanish install, where the real name is
+        'BUILTIN\\Usuarios'. The well-known SID is language-independent —
+        every Windows install resolves it the same way regardless of
+        locale — so this never breaks based on what language Windows is
+        running in.
     """
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
@@ -450,7 +485,7 @@ $ErrorActionPreference = 'Stop'
 $action    = New-ScheduledTaskAction -Execute '{exe_path}' -Argument '--tray'
 $logon     = New-ScheduledTaskTrigger -AtLogOn
 $watchdog  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650)
-$principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
 $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
 Register-ScheduledTask -TaskName '{_TRAY_TASK_NAME}' -Action $action -Trigger @($logon, $watchdog) -Principal $principal -Settings $settings -Force | Out-Null
@@ -501,6 +536,16 @@ def _tray_watchdog_check():
     as Windows is concerned the process never died. If the tray's heartbeat
     (written every 30s via POST /tray/heartbeat) goes stale, kill the PID it
     last reported so the watchdog task's next tick can bring up a fresh one.
+
+    Clears tray_heartbeat/tray_pid right after issuing the kill — without
+    this, if the Scheduled Task never actually brings up a replacement (it
+    failed to register at all, or the new instance dies before its first
+    heartbeat), this same stale timestamp+PID gets re-read on every future
+    2-minute tick forever, re-running taskkill against a PID that's already
+    long gone and re-logging the identical warning indefinitely. Clearing it
+    makes each stale heartbeat get acted on exactly once; if the tray really
+    is gone for good, `not heartbeat_raw` short-circuits on the next tick
+    instead of repeating the same no-op kill.
     """
     if os.name != "nt":
         return
@@ -518,6 +563,8 @@ def _tray_watchdog_check():
         pid = int(pid_raw)
         logger.warning(f"[tray] Heartbeat stale (last: {heartbeat.isoformat()}) — killing hung tray PID {pid}")
         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+        db.set_system_config("tray_heartbeat", "")
+        db.set_system_config("tray_pid", "")
     except Exception as e:
         logger.debug(f"[tray] Watchdog check skipped: {e}")
 

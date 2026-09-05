@@ -165,7 +165,14 @@ class _Handler(BaseHTTPRequestHandler):
             field = parts[3]
             try:
                 value = db.get_system_secret(field)
-                logger.warning(f"[system] Plaintext read of secret field '{field}' via API")
+                # DEBUG, no WARNING: esto se dispara cada vez que se abre la
+                # pestaña de Configuración (uno por cada secreto que precarga
+                # "Reemplazar") — como WARNING inundaba la consola y "Eventos
+                # recientes" del panel en cada apertura. Sigue quedando en el
+                # archivo de log (el sink de archivo captura desde DEBUG) para
+                # quien necesite auditar quién/cuándo leyó un secreto en texto
+                # plano vía API — solo deja de ser ruido del día a día.
+                logger.debug(f"[system] Plaintext read of secret field '{field}' via API")
                 self._json(200, {"field": field, "value": value})
             except ValueError as e:
                 self._json(400, {"error": str(e)})
@@ -209,8 +216,13 @@ class _Handler(BaseHTTPRequestHandler):
         # single top-level or extra_config secret field (e.g. 'password',
         # 'totp_secret'). Used only to pre-fill the "Reemplazar" dialog in the
         # panel so the user can see/edit the current value instead of typing
-        # blind. Logged — this is the one path that returns plaintext secrets
-        # over the API, by explicit design request.
+        # blind. Logged at DEBUG — this is the one path that returns plaintext
+        # secrets over the API, by explicit design request; it fires once per
+        # visible secret every time the Configuración tab opens, so WARNING
+        # was flooding the console/service.log (and "Eventos recientes" in
+        # the panel, which tails that file) on every single open. DEBUG keeps
+        # the trail in the log file (its sink captures from DEBUG up) without
+        # the day-to-day noise.
         if len(parts) == 5 and parts[0] == "config" and parts[1] == "agents" and parts[3] == "secret":
             if not self._auth():
                 self._json(401, {"error": "unauthorized"})
@@ -221,7 +233,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if cfg is None:
                     self._json(404, {"error": f"Unknown provider: {provider}"})
                     return
-                logger.warning(f"[{provider}] Plaintext read of secret field '{field}' via API")
+                logger.debug(f"[{provider}] Plaintext read of secret field '{field}' via API")
                 self._json(200, {"field": field, "value": cfg.get(field, "") or ""})
             except Exception as e:
                 self._json(500, {"error": str(e)})
@@ -244,7 +256,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if acc is None:
                     self._json(404, {"error": f"Unknown alias: {alias}"})
                     return
-                logger.warning(f"[{provider}] Plaintext read of account '{alias}' token via API")
+                logger.debug(f"[{provider}] Plaintext read of account '{alias}' token via API")
                 self._json(200, {"alias": alias, "value": acc.get("access_token", "") or ""})
             except Exception as e:
                 self._json(500, {"error": str(e)})

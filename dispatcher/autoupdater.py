@@ -167,7 +167,11 @@ def _github_config() -> dict | None:
     repo  = cfg.get("github_repo",  "").strip()
     if not (token and owner and repo):
         return None
-    logger.debug(f"[autoupdater] Token loaded — length={len(token)}, prefix={token[:8]}...")
+    # No logueamos nada del token acá: se llama en cada chequeo de update
+    # (hasta cada 1h, o cada 1min mientras hay jobs pendientes), y un
+    # prefix/longitud no aporta nada para debug — si el token es inválido,
+    # la respuesta 401 de GitHub más abajo ya lo deja clarísimo, sin
+    # necesidad de exponer ni un fragmento de la credencial en el log.
     return {"token": token, "owner": owner, "repo": repo}
 
 
